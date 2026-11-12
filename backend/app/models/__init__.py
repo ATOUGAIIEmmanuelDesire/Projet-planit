@@ -1,0 +1,1 @@
+"""Module des schémas Pydantic et modèles de données."""

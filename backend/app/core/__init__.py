@@ -1,0 +1,1 @@
+"""Core module pour la configuration globale et les paramètres système."""
