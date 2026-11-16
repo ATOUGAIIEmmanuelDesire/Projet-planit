@@ -6,8 +6,19 @@ import { TimetableGrid } from './components/TimetableGrid';
 import { HybridAssistant } from './components/HybridAssistant';
 import { AnalyticsROI } from './components/AnalyticsROI';
 import { ResourceManager } from './components/RessourceManager';
+import { Login } from './components/Login';
+import { Register } from './components/Register';
 
-import { Room, Teacher, Group, FIPAACLMessage, AssignmentResult, FullScheduleRequest, CourseSession } from './types';
+import {
+  Room,
+  Teacher,
+  Group,
+  FIPAACLMessage,
+  AssignmentResult,
+  FullScheduleRequest,
+  CourseSession,
+  UserProfile,
+} from './types';
 import { apiService, SMALogWebSocket } from './services/api';
 
 // Mots-clés des activités hors-cours (ne nécessitant aucun enseignant)
@@ -36,28 +47,37 @@ const requiresTeacher = (courseName: string): boolean => {
 };
 
 export const App: React.FC = () => {
+  // État d'authentification
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => {
+    const saved = localStorage.getItem('planit_user') || sessionStorage.getItem('planit_user');
+    return saved ? (JSON.parse(saved) as UserProfile) : null;
+  });
+  const [authView, setAuthView] = useState<'login' | 'register'>('login');
+
   const [activeTab, setActiveTab] = useState<number>(1); // ID 1 = Emploi du temps par défaut
   const [campus, setCampus] = useState<string>('Douala - Yansoki');
-  
+
   // Ressources et état de la simulation
   const [rooms, setRooms] = useState<Room[]>([]);
   const [teachers, setTeachers] = useState<Teacher[]>([]);
   const [groups, setGroups] = useState<Group[]>([]);
-  
+
   const [messages, setMessages] = useState<FIPAACLMessage[]>([]);
   const [assignments, setAssignments] = useState<AssignmentResult[]>([]);
-  
+
   const [occupancyRate, setOccupancyRate] = useState<number>(85.4);
   const [unresolvedConflicts, setUnresolvedConflicts] = useState<number>(0);
   const [lastExecTimeMs, setLastExecTimeMs] = useState<number>(180);
   const [totalSavedKwh, setTotalSavedKwh] = useState<number>(420.5);
-  
+
   const [wsConnected, setWsConnected] = useState<boolean>(false);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
 
   const roundValue = (val: number) => Math.round(val * 10) / 10;
 
   useEffect(() => {
+    if (!currentUser) return undefined;
+
     // 1. Charger les ressources (Salles, Profs, Groupes)
     apiService.getResources().then((data) => {
       if (data) {
@@ -77,8 +97,9 @@ export const App: React.FC = () => {
     }).catch(console.error);
 
     // 3. Connexion WebSocket temps réel pour les journaux FIPA-ACL
+    let wsManager: SMALogWebSocket | null = null;
     try {
-      const wsManager = new SMALogWebSocket();
+      wsManager = new SMALogWebSocket();
       wsManager.connect(
         (msg) => {
           setMessages((prev) => [...prev, msg]);
@@ -86,13 +107,31 @@ export const App: React.FC = () => {
         () => setWsConnected(false)
       );
       setWsConnected(true);
-
-      return () => wsManager.disconnect();
     } catch (err) {
       console.error("Erreur de connexion WebSocket :", err);
       setWsConnected(false);
     }
-  }, []);
+
+    return () => {
+      wsManager?.disconnect();
+    };
+  }, [currentUser]);
+
+  const handleLoginSuccess = (user: UserProfile) => {
+    setCurrentUser(user);
+    if (user.campus) {
+      setCampus(user.campus);
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('planit_token');
+    localStorage.removeItem('planit_user');
+    sessionStorage.removeItem('planit_token');
+    sessionStorage.removeItem('planit_user');
+    setCurrentUser(null);
+    setAuthView('login');
+  };
 
   const handleRunSimulation = async () => {
     setIsSimulating(true);
@@ -111,7 +150,6 @@ export const App: React.FC = () => {
           uniqueCoursesMap.set(a.course_id, {
             id: a.course_id,
             name: a.course_id,
-            // Affectation conditionnelle d'un enseignant ou de la mention 'Sans enseignant'
             teacher_id: needsTeacher ? (a.teacher_id || 'T_ENSEIGNANT') : 'Sans enseignant',
             group_id: a.group_id || 'PROMO',
             student_count: isStage ? 0 : 35,
@@ -180,6 +218,18 @@ export const App: React.FC = () => {
     }
   };
 
+  // Affichage des écrans Connexion / Inscription tant que l'utilisateur n'est pas connecté
+  if (!currentUser) {
+    return authView === 'login' ? (
+      <Login
+        onSuccess={handleLoginSuccess}
+        onSwitchToRegister={() => setAuthView('register')}
+      />
+    ) : (
+      <Register onSwitchToLogin={() => setAuthView('login')} />
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col font-sans">
       <Header
@@ -190,6 +240,8 @@ export const App: React.FC = () => {
         lastExecTimeMs={lastExecTimeMs}
         totalSavedKwh={totalSavedKwh}
         wsConnected={wsConnected}
+        currentUser={currentUser}
+        onLogout={handleLogout}
       />
 
       <TabNavigation activeTab={activeTab} setActiveTab={setActiveTab} />
@@ -197,8 +249,8 @@ export const App: React.FC = () => {
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-6">
         {/* Onglet 1 : Emploi du Temps */}
         {activeTab === 1 && (
-          <TimetableGrid 
-            assignments={assignments} 
+          <TimetableGrid
+            assignments={assignments}
             onAssignmentsUpdated={handleAssignmentsUpdated}
           />
         )}
@@ -213,7 +265,7 @@ export const App: React.FC = () => {
             isSimulating={isSimulating}
           />
         )}
-        
+
         {/* Onglet 3 : Assistant Hybride */}
         {activeTab === 3 && <HybridAssistant assignments={assignments} />}
 

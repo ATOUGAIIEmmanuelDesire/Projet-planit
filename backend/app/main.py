@@ -1,17 +1,23 @@
 import os
 import re
 import time
+import json
+import hmac
+import uuid
+import base64
+import hashlib
+import secrets
 import asyncio
 import inspect
 from glob import glob
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Tuple, Optional
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Tuple, Optional, Literal
 from contextlib import asynccontextmanager
 
 import pandas as pd
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Body, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
 from app.models.schemas import (
@@ -46,6 +52,8 @@ BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "..", "data")
 RESOURCE_DIR = os.path.join(DATA_DIR, "ressources")
 ICS_DIR = os.path.join(DATA_DIR, "ics")
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+AUTH_SECRET_KEY = os.getenv("PLANIT_SECRET_KEY", "planit-ucac-icam-secret-key-2026")
 
 # Mots-clés des activités hors-cours (exemptées d'enseignant)
 NON_TEACHER_KEYWORDS = [
@@ -63,6 +71,103 @@ coordinator: CoordinatorAgent = None
 
 class ConfirmRecommendationRequest(BaseModel):
     assignment: AssignmentResult
+
+
+# --- Schémas & Utilitaires d'Authentification ---
+UserRole = Literal[
+    "administrateur",
+    "enseignant",
+    "responsable_pedagogique",
+    "etudiant"
+]
+
+
+class UserRegisterRequest(BaseModel):
+    nom: str = Field(..., min_length=1, max_length=100)
+    prenom: str = Field(..., min_length=1, max_length=100)
+    email: str = Field(..., min_length=5, max_length=150)
+    campus: str = Field(default="Douala - Yansoki")
+    role: UserRole
+    password: str = Field(..., min_length=8)
+
+
+class UserLoginRequest(BaseModel):
+    email: str
+    password: str
+    rememberMe: bool = False
+
+
+class UserProfileOut(BaseModel):
+    id: str
+    nom: str
+    prenom: str
+    email: str
+    campus: str
+    role: UserRole
+    is_active: bool
+
+
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserProfileOut
+
+
+def _hash_password(password: str, salt: Optional[str] = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
+    return f"{salt}${dk.hex()}"
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        salt, expected_hex = stored_hash.split("$", 1)
+        candidate = _hash_password(password, salt)
+        return hmac.compare_digest(candidate, f"{salt}${expected_hex}")
+    except ValueError:
+        return False
+
+
+def _create_auth_token(user_id: str, email: str, remember_me: bool) -> str:
+    exp_hours = 24 * 7 if remember_me else 12
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": int((datetime.now(timezone.utc) + timedelta(hours=exp_hours)).timestamp())
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    b64_payload = base64.urlsafe_b64encode(raw).decode("utf-8")
+    sig = hmac.new(AUTH_SECRET_KEY.encode("utf-8"), b64_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{b64_payload}.{sig}"
+
+
+def _save_users(users: List[Dict[str, Any]]) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users, f, indent=2, ensure_ascii=False)
+
+
+def _load_users() -> List[Dict[str, Any]]:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if not os.path.exists(USERS_FILE):
+        default_admin = [
+            {
+                "id": "USR_ADMIN_01",
+                "nom": "Planit",
+                "prenom": "Admin",
+                "email": "admin@ucac-icam.com",
+                "campus": "Douala - Yansoki",
+                "role": "administrateur",
+                "password_hash": _hash_password("AdminPlanIt2026!"),
+                "is_active": True,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+        ]
+        _save_users(default_admin)
+        return default_admin
+
+    with open(USERS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def safe_int_capacity(val: Any, default: int = 40) -> int:
@@ -618,6 +723,7 @@ async def lifespan(app: FastAPI):
     """Gestionnaire de cycle de vie : Chargement Excel, initialisation des agents et des fichiers .ics."""
     global EXCEL_RESOURCES_DATA, STORED_ASSIGNMENTS
 
+    _load_users()
     EXCEL_RESOURCES_DATA = load_resources_from_excel()
     sync_in_memory_agents_from_excel()
 
@@ -667,6 +773,118 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --- Endpoints Authentification ---
+@app.post(f"{settings.API_V1_STR}/auth/register", status_code=status.HTTP_201_CREATED)
+def register_user(payload: UserRegisterRequest):
+    email_norm = payload.email.strip().lower()
+
+    if not re.match(r"^[a-zA-Z0-9._-]+@([a-zA-Z0-9-]+\.)?ucac-icam\.com$", email_norm):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Seules les adresses institutionnelles UCAC-ICAM (@ucac-icam.com ou @2027.ucac-icam.com) sont autorisées."
+        )
+
+    users = _load_users()
+    if any(u["email"].lower() == email_norm for u in users):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Un compte existe déjà avec cette adresse e-mail institutionnelle."
+        )
+
+    new_user = {
+        "id": f"USR_{uuid.uuid4().hex[:8].upper()}",
+        "nom": payload.nom.strip(),
+        "prenom": payload.prenom.strip(),
+        "email": email_norm,
+        "campus": payload.campus,
+        "role": payload.role,
+        "password_hash": _hash_password(payload.password),
+        "is_active": False,  # Validation administrateur requise avant la 1re connexion
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    users.append(new_user)
+    _save_users(users)
+
+    return {
+        "message": "Compte créé avec succès. En attente de validation par un administrateur."
+    }
+
+
+@app.post(f"{settings.API_V1_STR}/auth/login", response_model=AuthResponse)
+def login_user(payload: UserLoginRequest):
+    email_norm = payload.email.strip().lower()
+    users = _load_users()
+
+    user = next((u for u in users if u["email"].lower() == email_norm), None)
+    if not user or not _verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Adresse e-mail ou mot de passe incorrect."
+        )
+
+    if not user.get("is_active", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Votre compte n'a pas encore été validé par un administrateur."
+        )
+
+    token = _create_auth_token(user["id"], user["email"], payload.rememberMe)
+
+    return AuthResponse(
+        access_token=token,
+        user=UserProfileOut(
+            id=user["id"],
+            nom=user["nom"],
+            prenom=user["prenom"],
+            email=user["email"],
+            campus=user["campus"],
+            role=user["role"],
+            is_active=user["is_active"]
+        )
+    )
+
+
+@app.get(f"{settings.API_V1_STR}/auth/pending", response_model=List[UserProfileOut])
+def list_pending_users():
+    """Liste les comptes en attente d'activation par un administrateur."""
+    users = _load_users()
+    return [
+        UserProfileOut(
+            id=u["id"],
+            nom=u["nom"],
+            prenom=u["prenom"],
+            email=u["email"],
+            campus=u["campus"],
+            role=u["role"],
+            is_active=u["is_active"]
+        )
+        for u in users
+        if not u.get("is_active", False)
+    ]
+
+
+@app.patch(f"{settings.API_V1_STR}/auth/validate/{{user_id}}", response_model=UserProfileOut)
+def validate_user_account(user_id: str):
+    """Active un compte utilisateur après vérification administrateur."""
+    users = _load_users()
+    for user in users:
+        if user["id"] == user_id:
+            user["is_active"] = True
+            _save_users(users)
+            return UserProfileOut(
+                id=user["id"],
+                nom=user["nom"],
+                prenom=user["prenom"],
+                email=user["email"],
+                campus=user["campus"],
+                role=user["role"],
+                is_active=True
+            )
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Utilisateur introuvable.")
 
 
 # --- Endpoints Système & Ressources (CRUD Excel) ---

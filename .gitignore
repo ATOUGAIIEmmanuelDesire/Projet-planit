@@ -1,0 +1,22 @@
+@"
+# Python / Backend
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+.env
+backend/data/users.json
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.local
+
+# Système / Éditeurs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+"@ | Set-Content -Path .gitignore -Encoding UTF8

@@ -96,3 +96,41 @@ export interface FIPAACLMessage {
   timestamp: string;
   in_reply_to?: string;
 }
+
+// --- Types Authentification PlanIt ---
+export type UserRole =
+  | 'administrateur'
+  | 'enseignant'
+  | 'responsable_pedagogique'
+  | 'etudiant';
+
+export interface UserProfile {
+  id?: string;
+  nom: string;
+  prenom: string;
+  email: string;
+  campus: string;
+  role: UserRole;
+  is_active?: boolean;
+}
+
+export interface LoginPayload {
+  email: string;
+  password: string;
+  rememberMe: boolean;
+}
+
+export interface RegisterPayload {
+  nom: string;
+  prenom: string;
+  email: string;
+  campus: string;
+  role: UserRole;
+  password: string;
+}
+
+export interface AuthResponse {
+  access_token: string;
+  token_type: string;
+  user: UserProfile;
+}

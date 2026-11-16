@@ -1,5 +1,6 @@
 import React from 'react';
-import { Cpu, Zap, ShieldCheck, Clock, MapPin } from 'lucide-react';
+import { Cpu, Zap, ShieldCheck, Clock, MapPin, LogOut, UserCheck } from 'lucide-react';
+import { UserProfile } from '../types';
 
 interface HeaderProps {
   campus: string;
@@ -9,7 +10,16 @@ interface HeaderProps {
   lastExecTimeMs: number;
   totalSavedKwh: number;
   wsConnected: boolean;
+  currentUser?: UserProfile | null;
+  onLogout?: () => void;
 }
+
+const ROLE_LABELS: Record<string, string> = {
+  administrateur: 'Administrateur',
+  enseignant: 'Enseignant',
+  responsable_pedagogique: 'Resp. Pédagogique',
+  etudiant: 'Étudiant',
+};
 
 export const Header: React.FC<HeaderProps> = ({
   campus,
@@ -19,6 +29,8 @@ export const Header: React.FC<HeaderProps> = ({
   lastExecTimeMs,
   totalSavedKwh,
   wsConnected,
+  currentUser,
+  onLogout,
 }) => {
   return (
     <header className="bg-ucac-navy text-white shadow-xl border-b border-slate-700">
@@ -31,7 +43,9 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
           <div>
             <div className="flex items-center space-x-2">
-              <h1 className="text-xl font-bold tracking-tight">PlanIt <span className="text-ucac-orange">Ucac-Icam</span></h1>
+              <h1 className="text-xl font-bold tracking-tight">
+                PlanIt <span className="text-ucac-orange">Ucac-Icam</span>
+              </h1>
               <span className="text-xs bg-ucac-navyDark border border-slate-600 px-2 py-0.5 rounded text-slate-300 font-mono">
                 v1.0 SMA Engine
               </span>
@@ -42,8 +56,8 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
         </div>
 
-        {/* Sélecteur de Campus & Statut WebSocket */}
-        <div className="flex items-center space-x-4">
+        {/* Sélecteur de Campus, Statut WebSocket & Profil Connecté */}
+        <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center space-x-2 bg-ucac-navyDark px-3 py-1.5 rounded-lg border border-slate-700 text-sm">
             <MapPin className="w-4 h-4 text-ucac-orange" />
             <select
@@ -51,15 +65,54 @@ export const Header: React.FC<HeaderProps> = ({
               onChange={(e) => setCampus(e.target.value)}
               className="bg-transparent text-white font-medium focus:outline-none cursor-pointer"
             >
-              <option value="Douala - Yansoki" className="bg-ucac-navy text-white">Douala - Yansoki</option>
-              <option value="Pointe-Noire" className="bg-ucac-navy text-white">Pointe-Noire</option>
+              <option value="Douala - Yansoki" className="bg-ucac-navy text-white">
+                Douala - Yansoki
+              </option>
+              <option value="Pointe-Noire" className="bg-ucac-navy text-white">
+                Pointe-Noire
+              </option>
             </select>
           </div>
 
-          <div className="flex items-center space-x-2 text-xs bg-slate-800/80 px-2.5 py-1 rounded-full border border-slate-700">
-            <span className={`w-2.5 h-2.5 rounded-full ${wsConnected ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`} />
-            <span className="text-slate-300 font-mono">{wsConnected ? 'SMA Live WS' : 'Déconnecté'}</span>
+          <div
+            title="État de la connexion WebSocket avec le moteur multi-agents"
+            className="flex items-center space-x-2 text-xs bg-slate-800/80 px-2.5 py-1.5 rounded-full border border-slate-700"
+          >
+            <span
+              className={`w-2.5 h-2.5 rounded-full ${
+                wsConnected ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'
+              }`}
+            />
+            <span className="text-slate-300 font-mono">
+              {wsConnected ? 'SMA Live WS' : 'WS Hors ligne'}
+            </span>
           </div>
+
+          {currentUser && (
+            <div className="flex items-center gap-2.5 bg-ucac-navyDark pl-3 pr-2 py-1 rounded-lg border border-slate-700 text-xs">
+              <UserCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+              <div className="text-left leading-tight">
+                <div className="font-semibold text-white">
+                  {currentUser.prenom} {currentUser.nom}
+                </div>
+                <div className="text-[11px] text-emerald-400">
+                  {ROLE_LABELS[currentUser.role] || currentUser.role}
+                </div>
+              </div>
+
+              {onLogout && (
+                <button
+                  type="button"
+                  onClick={onLogout}
+                  title="Se déconnecter"
+                  className="ml-1 inline-flex items-center gap-1 rounded-md bg-rose-500/15 hover:bg-rose-500/30 text-rose-300 border border-rose-500/30 px-2 py-1 font-medium transition-colors cursor-pointer"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Déconnexion</span>
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
