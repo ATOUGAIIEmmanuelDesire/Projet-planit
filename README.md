@@ -172,7 +172,7 @@ docker run -d -p 8000:8000 --name planit-api planit-backend
 
 | Membre | Rôle & Contribution |
 | :--- | :--- |
-| **NOUNGOUA NOUNGOUA Teddy Steven** | Architecture du Système Multi-Agents (`app/sma/`), protocole FIPA-ACL & solveur |
+| **NOUNGOUA NOUNGOUA Teddy Steven (Chef projet)** | Architecture du Système Multi-Agents (`app/sma/`), protocole FIPA-ACL & solveur |
 | **ATOUGA II Emmanuel Désiré** | Architecture Backend FastAPI (`app/main.py`, `app/api/`, `app/services/`), Authentification, `.ics` & Excel |
 | **ANDOH Sus-shinley Mbaayi** | Développement Frontend React/TypeScript (`frontend/src/components/`), UX/UI |
 | **LEUBOU YAMDJEU Eddy Rayan** | Modélisation énergétique Green-IT (HVAC, $\text{CO}_2$, ROI) & validation fonctionnelle |
