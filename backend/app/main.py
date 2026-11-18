@@ -9,6 +9,7 @@ import hashlib
 import secrets
 import asyncio
 import inspect
+import unicodedata
 from glob import glob
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Tuple, Optional, Literal
@@ -27,7 +28,7 @@ from app.models.schemas import (
     FullScheduleRequest, FullScheduleResponse, CampusEnum
 )
 from app.sma.agents import MessageBus, RoomAgent, TeacherAgent, CoordinatorAgent
-from app.sma.protocol import FIPAACLMessage
+from app.sma.protocol import FIPAACLMessage, Performative
 from app.sma.solver import PlanItCPSolver
 from app.services.hyperplanning import HyperplanningService
 
@@ -35,7 +36,12 @@ from app.services.hyperplanning import HyperplanningService
 bus = MessageBus()
 room_agents: Dict[str, RoomAgent] = {}
 teacher_agents: Dict[str, TeacherAgent] = {}
-STORED_ASSIGNMENTS: List[AssignmentResult] = []
+
+# Séparation stricte :
+# 1. RAW_ICS_ASSIGNMENTS : données brutes des fichiers .ics simples (jamais modifiées par le SMA)
+# 2. OPTIMIZED_ASSIGNMENTS : emploi du temps complet optimisé par le SMA (toutes les semaines)
+RAW_ICS_ASSIGNMENTS: List[AssignmentResult] = []
+OPTIMIZED_ASSIGNMENTS: List[AssignmentResult] = []
 background_tasks = set()
 
 # Stockage global des 3 feuilles Excel extraites au démarrage
@@ -55,10 +61,14 @@ ICS_DIR = os.path.join(DATA_DIR, "ics")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 AUTH_SECRET_KEY = os.getenv("PLANIT_SECRET_KEY", "planit-ucac-icam-secret-key-2026")
 
-# Mots-clés des activités hors-cours (exemptées d'enseignant)
+# Mots-clés des activités sans enseignant (Finalisation Proj., Bilan Briefing, Projet, Soutenance, Autonomie, etc.)
+# Ces séances ne reçoivent jamais d'enseignant ("Sans enseignant")
 NON_TEACHER_KEYWORDS = [
-    "messe", "diversite", "diversité", "aercr", "aer", "autonomie", 
-    "stage", "vie asso", "vie associative", "cctl", "epreuve", "épreuve"
+    "messe", "diversite", "aercr", "aer", "autonomie",
+    "stage", "vie asso", "vie associative", "cctl", "epreuve",
+    "bilan", "briefing", "debriefing",
+    "finalisation", "projet", "soutenance", "jury",
+    "travail de groupe", "restitution"
 ]
 
 # Liste dynamique des ressources Pydantic pour la comptabilité SMA
@@ -111,6 +121,12 @@ class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserProfileOut
+
+
+def _strip_accents(text: str) -> str:
+    """Normalise une chaîne en minuscules sans accents."""
+    nfd = unicodedata.normalize("NFD", str(text or ""))
+    return "".join(ch for ch in nfd if unicodedata.category(ch) != "Mn").lower()
 
 
 def _hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -180,6 +196,19 @@ def safe_int_capacity(val: Any, default: int = 40) -> int:
         return default
 
 
+def is_non_teacher_activity(course_name: str) -> bool:
+    """
+    Vérifie si l'activité est sans enseignant
+    (ex: Finalisation Proj., Bilan Briefing, Projet, Soutenance, Autonomie, Stage, etc.).
+    """
+    c_norm = _strip_accents(course_name)
+    if any(kw in c_norm for kw in NON_TEACHER_KEYWORDS):
+        return True
+    if re.search(r"\bproj\.?(?:\s|$)", c_norm):
+        return True
+    return False
+
+
 def get_field_val(obj: Any, field_names: List[str], default: Any = None) -> Any:
     """Extrait une valeur, que l'objet soit une instance Pydantic/classe ou un dictionnaire."""
     for field in field_names:
@@ -192,10 +221,22 @@ def get_field_val(obj: Any, field_names: List[str], default: Any = None) -> Any:
     return default
 
 
+def _mark_as_raw_ics(assignments: List[AssignmentResult]) -> List[AssignmentResult]:
+    """Garantit que les affectations issues des .ics simples sont clairement identifiées comme brutes."""
+    for item in assignments:
+        if hasattr(item, "resolution_method"):
+            item.resolution_method = "HYPERPLANNING_ICS"
+        if hasattr(item, "score"):
+            item.score = 0.0
+        if hasattr(item, "hvac_saved_kwh"):
+            item.hvac_saved_kwh = 0.0
+    return assignments
+
+
 def create_agent_instance(agent_cls, **kwargs):
     """Instancie dynamiquement un agent SMA en inspectant sa signature __init__."""
     expanded_kwargs = dict(kwargs)
-    
+
     for key in ["room_schema", "teacher_schema"]:
         if key in kwargs and kwargs[key] is not None:
             obj = kwargs[key]
@@ -276,22 +317,24 @@ def create_assignment_result(cls, course_id, assigned_room, timeslot, teacher_id
 
 async def emit_sma_log(performative: str, sender: str, receiver: str, content: Dict[str, Any]):
     """Émet un message FIPA-ACL vers le terminal WebSocket en temps réel."""
+    perf_map = {
+        "CFP": Performative.CFP,
+        "CALL_FOR_PROPOSAL": Performative.CFP,
+        "BID": Performative.BID,
+        "ACCEPT_PROPOSAL": Performative.ACCEPT_PROPOSAL,
+        "REJECT_PROPOSAL": Performative.REJECT_PROPOSAL,
+        "INFORM": Performative.INFORM,
+        "FAILURE": Performative.FAILURE,
+    }
+    perf_enum = perf_map.get(str(performative).upper(), Performative.INFORM)
+
     try:
-        try:
-            msg = FIPAACLMessage(
-                performative=performative,
-                sender=sender,
-                receiver=receiver,
-                content=content
-            )
-        except Exception:
-            msg = FIPAACLMessage(
-                performative=performative,
-                sender=sender,
-                receiver=receiver,
-                content=content,
-                timestamp=datetime.now().isoformat()
-            )
+        msg = FIPAACLMessage(
+            performative=perf_enum,
+            sender=sender,
+            receiver=receiver,
+            content=content
+        )
 
         if hasattr(bus, "publish"):
             res = bus.publish(msg)
@@ -302,7 +345,6 @@ async def emit_sma_log(performative: str, sender: str, receiver: str, content: D
             if inspect.isawaitable(res):
                 await res
         else:
-            # Diffusion directe vers toutes les files d'attente WebSocket abonnées sur bus
             for attr_val in bus.__dict__.values():
                 if isinstance(attr_val, (list, set)):
                     for q in list(attr_val):
@@ -310,6 +352,75 @@ async def emit_sma_log(performative: str, sender: str, receiver: str, content: D
                             await q.put(msg)
     except Exception as e:
         print(f"⚠️ Erreur d'émission log FIPA-ACL : {e}")
+
+
+def _parse_session_date(raw_date: Optional[str], timeslot: str) -> Optional[datetime]:
+    """Convertit la date d'une séance en datetime en respectant le format YYYY-MM-DD ou DD/MM/YYYY."""
+    if raw_date:
+        s = str(raw_date).strip()
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(s[:10], fmt)
+            except ValueError:
+                continue
+        if re.match(r"^\d{8}$", s):
+            try:
+                return datetime.strptime(s, "%Y%m%d")
+            except ValueError:
+                pass
+
+    day_offsets = {
+        "lundi": 0, "mardi": 1, "mercredi": 2,
+        "jeudi": 3, "vendredi": 4, "samedi": 5, "dimanche": 6
+    }
+    slot_lower = str(timeslot or "").lower()
+    week_match = re.search(r"s(\d{1,2})_", slot_lower)
+    if week_match:
+        iso_year, _, _ = datetime.now().isocalendar()
+        iso_week = max(1, min(53, int(week_match.group(1))))
+        day_offset = next((off for d, off in day_offsets.items() if d in slot_lower), 0)
+        try:
+            return datetime.fromisocalendar(iso_year, iso_week, 1) + timedelta(days=day_offset)
+        except ValueError:
+            pass
+    return None
+
+
+def _get_two_month_period_id(session_date: Optional[str], timeslot: str) -> int:
+    """
+    Calcule l'identifiant d'une période de 02 mois (bimestre) pour piloter
+    la stabilité de salle par promotion sur 2 mois avant rotation.
+    Ex: Sept-Oct -> même identifiant ; Nov-Déc -> identifiant suivant (rotation).
+    """
+    dt = _parse_session_date(session_date, timeslot)
+    if dt is not None:
+        return (dt.year * 12 + (dt.month - 1)) // 2
+
+    week_match = re.search(r"s(\d{1,2})_", str(timeslot or "").lower())
+    if week_match:
+        return (int(week_match.group(1)) - 1) // 8
+    return 0
+
+
+def _format_timeslot_for_grid(raw_timeslot: str, target_date: datetime) -> str:
+    """
+    Formate le créneau pour l'emploi du temps optimisé :
+    S{semaine:02d}_{Jour}_{HHhMM-HHhMM} (ex: S47_Lundi_08h00-12h00).
+    """
+    jours = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+    jour_fr = jours[target_date.weekday()]
+    iso_week = target_date.isocalendar()[1]
+
+    slot_str = str(raw_timeslot or "08h00-12h00")
+    time_match = re.search(r"(\d{1,2}h\d{2}\s*-\s*\d{1,2}h\d{2})", slot_str)
+    if time_match:
+        plage = time_match.group(1).replace(" ", "")
+    elif "13h" in slot_str.lower() or "14h" in slot_str.lower():
+        plage = "13h00-17h00"
+    else:
+        plage = "08h00-12h00"
+
+    return f"S{iso_week:02d}_{jour_fr}_{plage}"
 
 
 def _build_ics_datetimes(timeslot: str, raw_date: Optional[str] = None) -> Tuple[str, str]:
@@ -336,26 +447,17 @@ def _build_ics_datetimes(timeslot: str, raw_date: Optional[str] = None) -> Tuple
     else:
         start_h, start_m, end_h, end_m = 8, 0, 12, 0
 
-    if raw_date:
-        digits = re.sub(r"[^0-9]", "", str(raw_date))
-        if len(digits) >= 8:
-            base_day = digits[:8]
-            return (
-                f"{base_day}T{start_h:02d}{start_m:02d}00",
-                f"{base_day}T{end_h:02d}{end_m:02d}00",
-            )
+    parsed_dt = _parse_session_date(raw_date, timeslot)
+    if parsed_dt:
+        base_day = parsed_dt.strftime("%Y%m%d")
+        return (
+            f"{base_day}T{start_h:02d}{start_m:02d}00",
+            f"{base_day}T{end_h:02d}{end_m:02d}00",
+        )
 
     now = datetime.now()
     iso_year, iso_week, _ = now.isocalendar()
-    week_match = re.search(r"s(\d{1,2})_", slot_lower)
-    if week_match:
-        iso_week = max(1, min(53, int(week_match.group(1))))
-
-    day_offset = 0
-    for day_name, offset in day_offsets.items():
-        if day_name in slot_lower:
-            day_offset = offset
-            break
+    day_offset = next((off for d, off in day_offsets.items() if d in slot_lower), 0)
 
     monday = datetime.fromisocalendar(iso_year, iso_week, 1)
     target_date = monday + timedelta(days=day_offset)
@@ -367,8 +469,11 @@ def _build_ics_datetimes(timeslot: str, raw_date: Optional[str] = None) -> Tuple
     )
 
 
-def save_assignments_to_ics(assignments: List[AssignmentResult], filepath: Optional[str] = None):
-    """Sauvegarde ou met à jour la liste complète des affectations dans planit_optimized_schedule.ics."""
+def save_optimized_assignments_to_ics(assignments: List[AssignmentResult], filepath: Optional[str] = None):
+    """
+    Sauvegarde UNIQUEMENT l'emploi du temps optimisé SMA dans planit_optimized_schedule.ics.
+    Les fichiers .ics simples d'origine ne sont jamais modifiés.
+    """
     if filepath is None:
         export_dir = os.path.join(DATA_DIR, "ics")
         os.makedirs(export_dir, exist_ok=True)
@@ -398,7 +503,7 @@ def save_assignments_to_ics(assignments: List[AssignmentResult], filepath: Optio
             f.write("END:VCALENDAR\n")
         print(f"✅ Fichier ICS optimisé synchronisé : {filepath}")
     except Exception as e:
-        print(f"⚠️ Erreur de sauvegarde du fichier .ics : {e}")
+        print(f"⚠️ Erreur de sauvegarde du fichier .ics optimisé : {e}")
 
 
 def resolve_excel_path() -> str:
@@ -466,7 +571,6 @@ def save_resources_to_excel():
     enseignants_cols = ["Nom et Prénom", TEACHER_DOMAIN_COL_NAME, "Expertises / Technologies"]
     promotions_cols = ["Promotion & Intitulé", "Niveau / Cycle", "Code promotion", "Effectif Etudiants"]
 
-    # Nettoyage des colonnes UI temporaires avant écriture
     clean_salles = [{k: row.get(k, "") for k in salles_cols} for row in EXCEL_RESOURCES_DATA["salles"]]
     clean_enseignants = []
     for row in EXCEL_RESOURCES_DATA["enseignants"]:
@@ -506,10 +610,11 @@ def sync_in_memory_agents_from_excel():
     if EXCEL_RESOURCES_DATA["salles"]:
         for idx, s in enumerate(EXCEL_RESOURCES_DATA["salles"]):
             code_salle = str(s.get("Code / Salle", f"Salle_{idx+1}"))
+            room_type = str(s.get("Type de Salle", "Salle de cours"))
             cap = safe_int_capacity(s.get("Capacité"), default=40)
             has_hvac = "Oui" in str(s.get("Capteur HVAC Smart", ""))
-            is_lab = "Labo" in str(s.get("Type de Salle", "")) or "FabLab" in str(s.get("Type de Salle", ""))
-            
+            is_lab = "Labo" in room_type or "FabLab" in room_type
+
             room_schema = RoomSchema(
                 id=f"R_{idx+1}",
                 name=code_salle,
@@ -526,6 +631,7 @@ def sync_in_memory_agents_from_excel():
                 capacity=cap,
                 has_hvac_sensor=has_hvac,
                 is_lab=is_lab,
+                room_type=room_type,
                 room_schema=room_schema,
                 bus=bus
             )
@@ -537,7 +643,7 @@ def sync_in_memory_agents_from_excel():
             name = str(t.get("Nom et Prénom", f"Enseignant_{idx+1}"))
             dept = str(t.get("Domaine ", t.get("Domaine", "Général")))
             t_id = f"T_{idx+1}"
-            
+
             teacher_schema = TeacherSchema(
                 id=t_id,
                 name=name,
@@ -578,81 +684,85 @@ def sync_in_memory_agents_from_excel():
 
 DOMAIN_KEYWORDS = {
     "finance_gestion": [
-        "finan", "compta", "gestion", "eco", "éco", "budget", "tresor", "trésor", 
-        "banque", "audit", "fiscal", "comptabilité", "contrôle de gestion", "finance"
+        "finan", "compta", "gestion", "eco", "budget", "tresor",
+        "banque", "audit", "fiscal", "comptabilite", "controle de gestion", "finance"
     ],
     "maths_stats": [
-        "math", "stat", "algebre", "algèbre", "calcul", "analyse", "probab", 
-        "geometrie", "géométrie", "mathematique", "mathématiques", "optimisation"
+        "math", "stat", "algebre", "calcul", "analyse", "probab",
+        "geometrie", "mathematique", "mathematiques", "optimisation"
     ],
     "informatique_dev": [
-        "dev", "code", "logiciel", "gl", "java", "python", "web", "algo", "algorithm", 
-        "data", "bdd", "sql", "ia", "ai", "application", "programmation", "c++", "poo"
+        "dev", "code", "logiciel", "gl", "java", "python", "web", "algo", "algorithm",
+        "data", "bdd", "sql", "ia", "ai", "application", "programmation", "c++", "poo",
+        "informatique", "si", "systeme d'information"
     ],
     "reseaux_infra": [
-        "reseau", "réseau", "infra", "sys", "systeme", "système", "rt", "telecom", 
-        "télécom", "cyber", "secu", "sécu", "cloud", "routeur", "cisco", "linux"
+        "reseau", "infra", "sys", "systeme", "rt", "telecom",
+        "cyber", "secu", "cloud", "routeur", "cisco", "linux", "iot"
     ],
     "management_projet": [
-        "projet", "manag", "management", "pmp", "risk", "qualit", "agile", "scrum", 
-        "organisation", "rh", "ressources humaines", "entrepreneuriat"
+        "manag", "management", "pmp", "risk", "qualit", "agile", "scrum",
+        "organisation", "rh", "ressources humaines", "entrepreneuriat",
+        "lean", "supply chain", "logistique", "industriel", "production"
     ],
     "sciences_ingenieur": [
-        "physique", "chimie", "electronique", "électronique", "thermo", "meca", 
-        "mécanique", "energie", "énergie", "automat", "electrotechnique", "matériaux"
+        "physique", "chimie", "electronique", "thermo", "meca",
+        "mecanique", "energie", "automat", "electrotechnique", "materiaux",
+        "maintenance", "genie", "cao", "dao", "fabrication"
     ],
     "humanites_langues": [
-        "anglais", "english", "comm", "communication", "droit", "francais", "français", 
-        "expression", "ethique", "éthique", "sociologie", "culture"
+        "anglais", "english", "comm", "communication", "droit", "francais",
+        "expression", "ethique", "sociologie", "culture", "philosophie", "leadership"
     ]
 }
 
 
 def rank_teachers_by_expertise(course_name: str, teachers_list: List[Dict[str, Any]], max_teachers: int = 3) -> List[Tuple[str, float]]:
-    """Classe les meilleurs enseignants de l'Excel par score de pertinence pour un cours donné."""
+    """Classe les meilleurs enseignants de l'Excel par score de pertinence et compétences pour un cours donné."""
     if not teachers_list:
         return [("Enseignant Qualifié", 75.0)]
 
-    c_lower = str(course_name or "").lower()
+    c_norm = _strip_accents(course_name)
 
-    course_domain = None
-    max_course_hits = 0
+    matched_domains = []
     for domain, kws in DOMAIN_KEYWORDS.items():
-        hits = sum(1 for kw in kws if kw in c_lower)
-        if hits > max_course_hits:
-            max_course_hits = hits
-            course_domain = domain
+        hits = sum(1 for kw in kws if kw in c_norm)
+        if hits > 0:
+            matched_domains.append((domain, hits))
+    matched_domains.sort(key=lambda x: x[1], reverse=True)
+    primary_domain = matched_domains[0][0] if matched_domains else None
 
     scored_teachers: List[Tuple[str, float, int]] = []
-    course_words = re.findall(r'\w{4,}', c_lower)
+    course_words = [w for w in re.findall(r"[a-z0-9]{3,}", c_norm) if w not in {"cours", "td", "tp", "cm", "avec", "pour", "dans"}]
 
     for idx, t in enumerate(teachers_list):
         name = str(t.get("Nom et Prénom", "")).strip()
         if not name:
             continue
 
-        dom = str(t.get("Domaine ", t.get("Domaine", ""))).lower()
-        exp = str(t.get("Expertises / Technologies", "")).lower()
+        dom = _strip_accents(t.get("Domaine ", t.get("Domaine", "")))
+        exp = _strip_accents(t.get("Expertises / Technologies", ""))
         teacher_profile = f"{dom} {exp}"
 
         raw_score = 0
-        if course_domain:
-            domain_kws = DOMAIN_KEYWORDS[course_domain]
-            if any(kw in teacher_profile for kw in domain_kws):
-                raw_score += 10
+        if primary_domain:
+            domain_kws = DOMAIN_KEYWORDS[primary_domain]
+            if any(kw in dom for kw in domain_kws):
+                raw_score += 12
+            if any(kw in exp for kw in domain_kws):
+                raw_score += 8
 
         for word in course_words:
-            if word in teacher_profile:
-                raw_score += 2
+            if word in exp:
+                raw_score += 5
+            elif word in dom:
+                raw_score += 3
 
-        # Conversion en pourcentage de pertinence pédagogique (entre 72% et 98%)
-        pct_score = min(98.0, 82.0 + raw_score * 1.2) if raw_score > 0 else max(70.0, 76.0 - (idx % 5))
+        pct_score = min(98.0, 82.0 + raw_score * 1.1) if raw_score > 0 else max(70.0, 76.0 - (idx % 5))
         scored_teachers.append((name, round(pct_score, 1), raw_score))
 
-    # Tri par score décroissant
     scored_teachers.sort(key=lambda item: (item[2], item[1]), reverse=True)
 
-    # Priorité aux enseignants ayant un score > 0 ; complément si moins de max_teachers
     relevant = [(name, pct) for name, pct, raw in scored_teachers if raw > 0]
     if len(relevant) >= max_teachers:
         return relevant[:max_teachers]
@@ -668,39 +778,228 @@ def rank_teachers_by_expertise(course_name: str, teachers_list: List[Dict[str, A
     return relevant[:max_teachers] if relevant else [("Enseignant Qualifié", 75.0)]
 
 
-def match_teacher_by_expertise(course_name: str, teachers_list: List[Dict[str, Any]], idx: int = 0) -> str:
-    """Attribue le meilleur enseignant issu de l'Excel selon un scoring par domaine et pertinence."""
+def match_teacher_by_expertise(
+    course_name: str,
+    teachers_list: List[Dict[str, Any]],
+    idx: int = 0,
+    busy_teachers: Optional[set] = None,
+    preferred_teacher: Optional[str] = None
+) -> str:
+    """
+    Attribue l'enseignant le plus compétent disponible issu de l'Excel
+    (en conservant l'intervenant déjà attribué au même cours de la promotion s'il est disponible).
+    """
     if not course_name or not teachers_list:
         return "Enseignant Qualifié"
-    ranked = rank_teachers_by_expertise(course_name, teachers_list, max_teachers=1)
-    if ranked:
-        return ranked[0][0]
+
+    busy = busy_teachers or set()
+
+    if preferred_teacher and preferred_teacher != "Sans enseignant" and preferred_teacher.lower() not in busy:
+        return preferred_teacher
+
+    ranked = rank_teachers_by_expertise(course_name, teachers_list, max_teachers=max(8, len(teachers_list)))
+    for candidate_name, _ in ranked:
+        if candidate_name.lower() not in busy:
+            return candidate_name
+
     fallback_name = teachers_list[idx % len(teachers_list)].get("Nom et Prénom")
     return str(fallback_name) if fallback_name else "Enseignant Qualifié"
 
 
-def match_room_by_capacity_hvac(course_name: str, student_count: int, salles_list: List[Dict[str, Any]], idx: int) -> Tuple[str, float]:
-    """Attribue une salle Excel de capacité adéquate avec optimisation des capteurs HVAC Smart."""
-    c_lower = str(course_name or "").lower()
-    
-    if "stage" in c_lower:
+def _is_workroom(room_dict: Dict[str, Any]) -> bool:
+    """Identifie une salle de travail / salle de classe (hors amphithéâtre)."""
+    code = _strip_accents(room_dict.get("Code / Salle", ""))
+    rtype = _strip_accents(room_dict.get("Type de Salle", ""))
+    return "amphi" not in code and "amphi" not in rtype
+
+
+def _room_hvac_kwh(room_code: str, salles_list: List[Dict[str, Any]]) -> float:
+    """Retourne le gain énergétique HVAC associé à une salle donnée."""
+    if not room_code or "stage" in _strip_accents(room_code):
+        return 0.0
+    for s in salles_list:
+        if str(s.get("Code / Salle", "")).strip().lower() == room_code.strip().lower():
+            return 0.85 if "Oui" in str(s.get("Capteur HVAC Smart", "")) else 0.40
+    return 0.40
+
+
+def _allocate_promo_rooms_by_two_month_periods(
+    target_sessions: List[Dict[str, Any]],
+    promo_effects: Dict[str, int],
+    salles_list: List[Dict[str, Any]]
+) -> Dict[Tuple[str, int], str]:
+    """
+    Alloue UNE ET UNE SEULE salle par promotion pour chaque période de 02 mois,
+    puis effectue une rotation obligatoire vers une nouvelle salle à la période de 02 mois suivante.
+    """
+    if not salles_list:
+        return {}
+
+    periods_promos: Dict[int, List[str]] = {}
+    for s in target_sessions:
+        if "stage" in _strip_accents(s["course_id"]):
+            continue
+        p_id = s["period_id"]
+        promo = s["group_id"]
+        plist = periods_promos.setdefault(p_id, [])
+        if promo not in plist:
+            plist.append(promo)
+
+    allocation: Dict[Tuple[str, int], str] = {}
+    last_room_by_promo: Dict[str, str] = {}
+
+    for rotation_step, p_id in enumerate(sorted(periods_promos.keys())):
+        active_promos = periods_promos[p_id]
+        used_rooms_in_period: set = set()
+
+        # Priorise les promotions avec les plus grands effectifs pour garantir le respect des capacités
+        active_promos_sorted = sorted(
+            active_promos,
+            key=lambda pr: promo_effects.get(pr.lower(), 35),
+            reverse=True
+        )
+
+        for p_idx, promo_code in enumerate(active_promos_sorted):
+            student_count = promo_effects.get(promo_code.lower(), 35)
+            prev_room = last_room_by_promo.get(promo_code)
+
+            # 1. Salles respectant la capacité de la promotion
+            eligible = [
+                s for s in salles_list
+                if safe_int_capacity(s.get("Capacité"), 40) >= student_count
+            ]
+            if not eligible:
+                eligible = list(salles_list)
+
+            # 2. Privilégie les salles de classe / salles de travail (hors amphithéâtres)
+            workrooms = [s for s in eligible if _is_workroom(s)]
+            if len(workrooms) >= len(active_promos_sorted):
+                eligible = workrooms
+
+            # 3. Exclut les salles déjà attribuées à une autre promotion sur ces 2 mois
+            free_in_period = [
+                s for s in eligible
+                if str(s.get("Code / Salle", "")).strip().lower() not in used_rooms_in_period
+            ]
+            candidates = free_in_period if free_in_period else eligible
+
+            # 4. Rotation : exclut la salle occupée par cette promotion lors des 2 mois précédents
+            if prev_room and len(candidates) > 1:
+                rotated_candidates = [
+                    s for s in candidates
+                    if str(s.get("Code / Salle", "")).strip().lower() != prev_room.strip().lower()
+                ]
+                if rotated_candidates:
+                    candidates = rotated_candidates
+
+            # 5. Tri Green-IT (Capteur HVAC Smart + ajustement optimal de capacité) + décalage de rotation
+            candidates.sort(
+                key=lambda r: (
+                    0 if "Oui" in str(r.get("Capteur HVAC Smart", "")) else 1,
+                    safe_int_capacity(r.get("Capacité"), 40),
+                    str(r.get("Code / Salle", ""))
+                )
+            )
+
+            chosen_dict = candidates[(rotation_step + p_idx) % len(candidates)]
+            chosen_room = str(chosen_dict.get("Code / Salle", "Salle 101")).strip()
+
+            allocation[(promo_code, p_id)] = chosen_room
+            used_rooms_in_period.add(chosen_room.lower())
+            last_room_by_promo[promo_code] = chosen_room
+
+    return allocation
+
+
+def match_room_by_capacity_hvac(
+    course_name: str,
+    student_count: int,
+    salles_list: List[Dict[str, Any]],
+    idx: int,
+    occupied_rooms_for_slot: Optional[set] = None,
+    preferred_room_for_promo: Optional[str] = None,
+    workroom_only: bool = False
+) -> Tuple[str, float]:
+    """
+    Attribue une salle Excel :
+    - Si `preferred_room_for_promo` est défini (salle dédiée de la promotion sur les 2 mois),
+      l'applique systématiquement à toutes les activités sur campus de la promotion.
+    """
+    c_norm = _strip_accents(course_name)
+    occupied = occupied_rooms_for_slot or set()
+
+    if "stage" in c_norm:
         return "Hors campus / Stage", 0.0
 
-    if any(k in c_lower for k in ["messe", "diversit"]):
-        amphis = [s for s in salles_list if "amphi" in str(s.get("Type de Salle", "")).lower() or "amphi" in str(s.get("Code / Salle", "")).lower()]
-        room_name = str(amphis[0].get("Code / Salle")) if amphis else "Grand Amphi"
-        return room_name, 0.50
+    if preferred_room_for_promo:
+        return preferred_room_for_promo, _room_hvac_kwh(preferred_room_for_promo, salles_list)
 
     eligible = [s for s in salles_list if safe_int_capacity(s.get("Capacité")) >= student_count]
     if not eligible:
-        eligible = salles_list or [{"Code / Salle": "Salle 101", "Capteur HVAC Smart": "Oui"}]
+        eligible = salles_list or [{"Code / Salle": "Salle 101", "Capteur HVAC Smart": "Oui", "Type de Salle": "Salle de cours"}]
 
-    hvac_smart = [s for s in eligible if "Oui" in str(s.get("Capteur HVAC Smart", ""))]
-    pool = hvac_smart if hvac_smart else eligible
-    chosen = pool[idx % len(pool)]
+    if workroom_only:
+        workrooms = [s for s in eligible if _is_workroom(s)]
+        if workrooms:
+            eligible = workrooms
 
+    free_eligible = [
+        s for s in eligible
+        if str(s.get("Code / Salle", "")).lower() not in occupied
+    ]
+    pool_base = free_eligible if free_eligible else eligible
+
+    hvac_smart = [s for s in pool_base if "Oui" in str(s.get("Capteur HVAC Smart", ""))]
+    pool = hvac_smart if hvac_smart else pool_base
+    pool.sort(key=lambda r: safe_int_capacity(r.get("Capacité"), 40))
+
+    chosen = pool[idx % len(pool)] if len(pool) > 1 else pool[0]
     saved_kwh = 0.85 if "Oui" in str(chosen.get("Capteur HVAC Smart", "")) else 0.40
     return str(chosen.get("Code / Salle", "Salle 101")), saved_kwh
+
+
+def prepare_all_sessions_for_sma(raw_sessions: List[Any]) -> List[Dict[str, Any]]:
+    """
+    Prépare l'intégralité des séances de l'emploi du temps (toutes les semaines et toutes les promotions)
+    pour la négociation SMA, avec calcul de leur période bimestrielle (02 mois).
+    """
+    if not raw_sessions:
+        return []
+
+    prepared: List[Dict[str, Any]] = []
+
+    for idx, session in enumerate(raw_sessions):
+        course_name = get_field_val(session, ["course_id", "name", "id", "summary"], default=f"Cours_{idx+1}")
+        group_code = get_field_val(session, ["group_id", "group", "promo"], default="PROMO")
+        slot_time = str(get_field_val(session, ["timeslot", "preferred_timeslot", "start_time"], default="Lundi_08h00-12h00"))
+        raw_date = get_field_val(session, ["date", "start_date"], default=None)
+
+        dt = _parse_session_date(raw_date, slot_time)
+
+        if re.match(r"^S\d{1,2}_", slot_time.strip(), flags=re.IGNORECASE):
+            formatted_slot = slot_time.strip()
+        elif dt is not None:
+            formatted_slot = _format_timeslot_for_grid(slot_time, dt)
+        else:
+            formatted_slot = slot_time.strip()
+
+        normalized_date = (
+            dt.strftime("%Y-%m-%d")
+            if dt is not None
+            else (str(raw_date).strip() if raw_date else None)
+        )
+        period_id = _get_two_month_period_id(normalized_date, formatted_slot)
+
+        prepared.append({
+            "course_id": str(course_name),
+            "group_id": str(group_code),
+            "timeslot": formatted_slot,
+            "date": normalized_date,
+            "period_id": period_id,
+        })
+
+    prepared.sort(key=lambda s: (s["period_id"], s["date"] or "", s["timeslot"], s["group_id"]))
+    return prepared
 
 
 async def agent_router():
@@ -721,7 +1020,7 @@ async def agent_router():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestionnaire de cycle de vie : Chargement Excel, initialisation des agents et des fichiers .ics."""
-    global EXCEL_RESOURCES_DATA, STORED_ASSIGNMENTS
+    global EXCEL_RESOURCES_DATA, RAW_ICS_ASSIGNMENTS, OPTIMIZED_ASSIGNMENTS
 
     _load_users()
     EXCEL_RESOURCES_DATA = load_resources_from_excel()
@@ -731,26 +1030,42 @@ async def lifespan(app: FastAPI):
     background_tasks.add(router_task)
     router_task.add_done_callback(background_tasks.discard)
 
-    STORED_ASSIGNMENTS.clear()
+    RAW_ICS_ASSIGNMENTS.clear()
+    OPTIMIZED_ASSIGNMENTS.clear()
+
     if os.path.exists(ICS_DIR):
-        ics_files = [
+        simple_ics_files = [
             f for f in glob(os.path.join(ICS_DIR, "*.ics"))
             if os.path.basename(f).lower() != "planit_optimized_schedule.ics"
         ]
-        for file_path in ics_files:
+        for file_path in simple_ics_files:
             filename = os.path.basename(file_path)
             promo_from_filename = os.path.splitext(filename)[0]
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                    assignments = HyperplanningService.parse_ics_content(
-                        content, 
+                    parsed = HyperplanningService.parse_ics_content(
+                        content,
                         default_promo=promo_from_filename
                     )
-                    STORED_ASSIGNMENTS.extend(assignments)
+                    RAW_ICS_ASSIGNMENTS.extend(_mark_as_raw_ics(parsed))
             except Exception as e:
                 print(f"Erreur chargement {file_path} : {e}")
-        print(f"✅ {len(STORED_ASSIGNMENTS)} cours chargés depuis {len(ics_files)} fichiers .ics")
+        print(f"✅ {len(RAW_ICS_ASSIGNMENTS)} cours simples chargés depuis {len(simple_ics_files)} fichiers .ics")
+
+        opt_file = os.path.join(ICS_DIR, "planit_optimized_schedule.ics")
+        if os.path.exists(opt_file):
+            try:
+                with open(opt_file, "r", encoding="utf-8") as f:
+                    opt_parsed = HyperplanningService.parse_ics_content(f.read(), default_promo="PROMO")
+                    for item in opt_parsed:
+                        item.resolution_method = "SMA_CNP"
+                        if not getattr(item, "score", 0):
+                            item.score = 95.0
+                    OPTIMIZED_ASSIGNMENTS.extend(opt_parsed)
+                print(f"✅ {len(OPTIMIZED_ASSIGNMENTS)} cours optimisés chargés depuis planit_optimized_schedule.ics")
+            except Exception as e:
+                print(f"Erreur chargement planning optimisé : {e}")
 
     yield
 
@@ -766,9 +1081,20 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+raw_origins = list(settings.CORS_ORIGINS) if settings.CORS_ORIGINS else ["*"]
+if "*" not in raw_origins:
+    for local_origin in [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]:
+        if local_origin not in raw_origins:
+            raw_origins.append(local_origin)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=raw_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -801,7 +1127,7 @@ def register_user(payload: UserRegisterRequest):
         "campus": payload.campus,
         "role": payload.role,
         "password_hash": _hash_password(payload.password),
-        "is_active": False,  # Validation administrateur requise avant la 1re connexion
+        "is_active": False,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
 
@@ -848,6 +1174,7 @@ def login_user(payload: UserLoginRequest):
 
 
 @app.get(f"{settings.API_V1_STR}/auth/pending", response_model=List[UserProfileOut])
+@app.get("/api/auth/pending", response_model=List[UserProfileOut])
 def list_pending_users():
     """Liste les comptes en attente d'activation par un administrateur."""
     users = _load_users()
@@ -866,7 +1193,10 @@ def list_pending_users():
     ]
 
 
+@app.post(f"{settings.API_V1_STR}/auth/validate/{{user_id}}", response_model=UserProfileOut)
 @app.patch(f"{settings.API_V1_STR}/auth/validate/{{user_id}}", response_model=UserProfileOut)
+@app.post("/api/auth/validate/{user_id}", response_model=UserProfileOut)
+@app.patch("/api/auth/validate/{user_id}", response_model=UserProfileOut)
 def validate_user_account(user_id: str):
     """Active un compte utilisateur après vérification administrateur."""
     users = _load_users()
@@ -892,6 +1222,7 @@ def validate_user_account(user_id: str):
 def root():
     return {"status": "online", "system": settings.PROJECT_NAME, "version": settings.VERSION}
 
+
 @app.get("/health")
 def health_check():
     return {
@@ -899,6 +1230,7 @@ def health_check():
         "campus_active": settings.DEFAULT_CAMPUS,
         "agents_online": len(room_agents) + len(teacher_agents) + (1 if coordinator else 0)
     }
+
 
 @app.get(f"{settings.API_V1_STR}/resources")
 @app.get("/api/resources")
@@ -1016,12 +1348,19 @@ async def negotiate_single_session(req: SingleNegotiationRequest):
     if not coordinator:
         raise HTTPException(status_code=503, detail="Le coordinateur SMA n'est pas initialisé.")
 
-    # Diffusion en direct dans le terminal SMA de la résolution de conflit
+    teacherless = is_non_teacher_activity(req.course_id)
+    effective_teacher_id = "Sans enseignant" if teacherless else req.teacher_id
+
     await emit_sma_log(
         "CFP",
         "Coordinator_UcacIcam",
         "ALL_ROOM_AGENTS",
-        {"course": req.course_id, "timeslot": req.timeslot, "students": req.students_count}
+        {
+            "course": req.course_id,
+            "timeslot": req.timeslot,
+            "students": req.students_count,
+            "mode": "Salle_de_travail_sans_enseignant" if teacherless else "Cours_encadre"
+        }
     )
 
     salles_list = EXCEL_RESOURCES_DATA.get("salles", [])
@@ -1038,25 +1377,31 @@ async def negotiate_single_session(req: SingleNegotiationRequest):
         course_id=req.course_id,
         timeslot=req.timeslot,
         students_count=req.students_count,
-        teacher_id=req.teacher_id,
+        teacher_id=effective_teacher_id,
         group_id=req.group_id,
-        requires_lab=req.requires_lab
+        requires_lab=req.requires_lab,
+        workroom_only=teacherless
     )
 
     if not result:
-        # Arbitrage Pareto de secours si aucune salle unique n'atteint la capacité demandée
-        best_room, kwh = match_room_by_capacity_hvac(req.course_id, req.students_count, salles_list, 0)
+        best_room, kwh = match_room_by_capacity_hvac(
+            req.course_id,
+            req.students_count,
+            salles_list,
+            0,
+            workroom_only=teacherless
+        )
         await emit_sma_log(
             "BID",
             best_room,
             "Coordinator_UcacIcam",
-            {"hvac_saved_kwh": kwh, "mode": "Arbitrage_Capacite_Maximale"}
+            {"hvac_saved_kwh": kwh, "mode": "Arbitrage_Salle_Travail" if teacherless else "Arbitrage_Capacite_Maximale"}
         )
         await emit_sma_log(
             "ACCEPT_PROPOSAL",
             "Coordinator_UcacIcam",
             best_room,
-            {"course": req.course_id, "timeslot": req.timeslot, "status": "Conflit résolu par arbitrage"}
+            {"course": req.course_id, "timeslot": req.timeslot, "teacher": effective_teacher_id}
         )
         exec_time_ms = round((time.time() - t0) * 1000, 2)
         return NegotiationResponse(
@@ -1069,7 +1414,7 @@ async def negotiate_single_session(req: SingleNegotiationRequest):
         "ACCEPT_PROPOSAL",
         "Coordinator_UcacIcam",
         str(result.get("assigned_room", "Salle 101")),
-        {"course": req.course_id, "timeslot": req.timeslot, "teacher": result.get("teacher_id", req.teacher_id)}
+        {"course": req.course_id, "timeslot": req.timeslot, "teacher": effective_teacher_id}
     )
 
     exec_time_ms = round((time.time() - t0) * 1000, 2)
@@ -1084,7 +1429,7 @@ async def negotiate_single_session(req: SingleNegotiationRequest):
         course_id=result.get("course_id", req.course_id),
         assigned_room=result.get("assigned_room", "Salle 101"),
         timeslot=result.get("timeslot", req.timeslot),
-        teacher_id=result.get("teacher_id", req.teacher_id),
+        teacher_id=effective_teacher_id,
         group_id=result.get("group_id", req.group_id),
         kwh=result.get("hvac_kwh", result.get("hvac_saved_kwh", 0.0)),
         score=result.get("score", 95.0),
@@ -1102,69 +1447,117 @@ async def negotiate_single_session(req: SingleNegotiationRequest):
 @app.post(f"{settings.API_V1_STR}/negotiate/full-schedule", response_model=FullScheduleResponse)
 async def generate_full_schedule(payload: FullScheduleRequest):
     t0 = time.time()
-    global STORED_ASSIGNMENTS
+    global OPTIMIZED_ASSIGNMENTS
 
     salles_list = EXCEL_RESOURCES_DATA.get("salles", [])
     teachers_list = EXCEL_RESOURCES_DATA.get("enseignants", [])
     promos_list = EXCEL_RESOURCES_DATA.get("promotions", [])
 
     promo_effects = {
-        str(p.get("Code promotion", "")).lower(): safe_int_capacity(p.get("Effectif Etudiants"), default=35) 
+        str(p.get("Code promotion", "")).lower(): safe_int_capacity(p.get("Effectif Etudiants"), default=35)
         for p in promos_list
     }
 
-    target_sessions = STORED_ASSIGNMENTS if len(STORED_ASSIGNMENTS) > 0 else payload.courses
+    # Lecture de la totalité des séances sources sans altérer RAW_ICS_ASSIGNMENTS
+    source_sessions = RAW_ICS_ASSIGNMENTS if len(RAW_ICS_ASSIGNMENTS) > 0 else payload.courses
+    target_sessions = prepare_all_sessions_for_sma(source_sessions)
 
-    optimized_assignments: List[AssignmentResult] = []
+    # Allocation de UNE ET UNE SEULE salle par promotion sur 02 mois, avec rotation à la période suivante
+    promo_room_by_period = _allocate_promo_rooms_by_two_month_periods(
+        target_sessions=target_sessions,
+        promo_effects=promo_effects,
+        salles_list=salles_list
+    )
+
+    unique_promos = list(dict.fromkeys(s["group_id"] for s in target_sessions))
+    occupied_teachers_by_slot: Dict[Tuple[str, str], set] = {}
+    course_teacher_affinity: Dict[Tuple[str, str], str] = {}
+
+    optimized_list: List[AssignmentResult] = []
     total_saved_kwh = 0.0
 
-    # Émission d'initialisation du protocole Contract Net sur le terminal SMA
     await emit_sma_log(
         "CFP",
         "Coordinator_UcacIcam",
         f"AGENTS_POOL ({len(room_agents)} Salles, {len(teacher_agents)} Enseignants)",
-        {"sessions_to_schedule": len(target_sessions), "protocol": "FIPA-ACL Contract Net Green-IT"}
+        {
+            "scope": "Emploi du temps complet (salle unique par promotion sur 02 mois avec rotation)",
+            "promotions": len(unique_promos),
+            "sessions_to_schedule": len(target_sessions),
+            "protocol": "FIPA-ACL Contract Net Green-IT"
+        }
     )
 
     for idx, session in enumerate(target_sessions):
-        course_name = get_field_val(session, ["course_id", "name", "id", "summary"], default=f"Cours_{idx+1}")
-        group_code = get_field_val(session, ["group_id", "group", "promo"], default="PROMO")
-        slot_time = get_field_val(session, ["timeslot", "preferred_timeslot", "start_time"], default="S45_Lundi_08h00-12h00")
-        session_date = get_field_val(session, ["date", "start_date"], default=None)
+        course_name = session["course_id"]
+        group_code = session["group_id"]
+        slot_time = session["timeslot"]
+        session_date = session["date"]
+        period_id = session["period_id"]
+
+        slot_key = (str(session_date or ""), str(slot_time).lower())
+        busy_teachers = occupied_teachers_by_slot.setdefault(slot_key, set())
 
         student_count = promo_effects.get(str(group_code).lower(), 35)
+        teacherless = is_non_teacher_activity(course_name)
 
-        is_non_teacher = any(k in str(course_name).lower() for k in NON_TEACHER_KEYWORDS)
-        if is_non_teacher:
+        # 1. Enseignants : uniquement sur les activités encadrées et selon leurs compétences
+        if teacherless:
             assigned_teacher = "Sans enseignant"
         else:
-            assigned_teacher = match_teacher_by_expertise(course_name, teachers_list, idx)
+            course_key = (group_code.lower(), _strip_accents(course_name))
+            assigned_teacher = match_teacher_by_expertise(
+                course_name,
+                teachers_list,
+                idx,
+                busy_teachers=busy_teachers,
+                preferred_teacher=course_teacher_affinity.get(course_key)
+            )
+            if assigned_teacher and assigned_teacher != "Sans enseignant":
+                busy_teachers.add(assigned_teacher.lower())
+                course_teacher_affinity.setdefault(course_key, assigned_teacher)
 
-        assigned_room, kwh = match_room_by_capacity_hvac(course_name, student_count, salles_list, idx)
+        # 2. Salle : toutes les activités sur campus de la promotion partagent sa salle unique sur 02 mois
+        dedicated_room = promo_room_by_period.get((group_code, period_id))
+        assigned_room, kwh = match_room_by_capacity_hvac(
+            course_name=course_name,
+            student_count=student_count,
+            salles_list=salles_list,
+            idx=idx,
+            preferred_room_for_promo=dedicated_room,
+            workroom_only=teacherless
+        )
+
         total_saved_kwh += kwh
 
-        # Diffusion des trames FIPA-ACL sur le terminal en direct
-        await emit_sma_log(
-            "CFP",
-            "Coordinator_UcacIcam",
-            "Room_&_Teacher_Agents",
-            {"course": course_name, "promo": group_code, "timeslot": slot_time, "students": student_count}
-        )
-        await emit_sma_log(
-            "BID",
-            assigned_room,
-            "Coordinator_UcacIcam",
-            {"hvac_saved_kwh": kwh, "teacher_candidate": assigned_teacher}
-        )
-        await emit_sma_log(
-            "ACCEPT_PROPOSAL",
-            "Coordinator_UcacIcam",
-            f"{assigned_room} & {assigned_teacher}",
-            {"course": course_name, "timeslot": slot_time, "pareto_score": 95.0}
-        )
-        # Courte pause toutes les 5 sessions pour fluidifier l'affichage temps réel du terminal
-        if idx % 5 == 0:
-            await asyncio.sleep(0.01)
+        if idx < 24 or idx % 8 == 0:
+            await emit_sma_log(
+                "CFP",
+                "Coordinator_UcacIcam",
+                "Room_Agents" if teacherless else "Room_&_Teacher_Agents",
+                {
+                    "course": course_name,
+                    "promo": group_code,
+                    "timeslot": slot_time,
+                    "cycle_salle_2_mois": dedicated_room or assigned_room,
+                    "type": "Activité autonome / Projet (Sans enseignant)" if teacherless else "Cours encadré (Compétence)"
+                }
+            )
+            await emit_sma_log(
+                "BID",
+                assigned_room,
+                "Coordinator_UcacIcam",
+                {"hvac_saved_kwh": kwh, "teacher": assigned_teacher}
+            )
+            await emit_sma_log(
+                "ACCEPT_PROPOSAL",
+                "Coordinator_UcacIcam",
+                assigned_room if teacherless else f"{assigned_room} & {assigned_teacher}",
+                {"course": course_name, "promo": group_code, "timeslot": slot_time}
+            )
+
+        if idx % 25 == 0:
+            await asyncio.sleep(0.005)
 
         item = create_assignment_result(
             AssignmentResult,
@@ -1178,13 +1571,14 @@ async def generate_full_schedule(payload: FullScheduleRequest):
             resolution_method="SMA_CNP",
             date=session_date
         )
-        optimized_assignments.append(item)
+        optimized_list.append(item)
 
-    STORED_ASSIGNMENTS = optimized_assignments
-    save_assignments_to_ics(STORED_ASSIGNMENTS)
+    # Mise à jour uniquement du planning optimisé et du fichier dédié planit_optimized_schedule.ics
+    OPTIMIZED_ASSIGNMENTS = optimized_list
+    save_optimized_assignments_to_ics(OPTIMIZED_ASSIGNMENTS)
 
     exec_time_ms = round((time.time() - t0) * 1000, 2)
-    total_courses = len(optimized_assignments)
+    total_courses = len(optimized_list)
 
     return FullScheduleResponse(
         success=True,
@@ -1195,7 +1589,7 @@ async def generate_full_schedule(payload: FullScheduleRequest):
         total_energy_saved_kwh=round(total_saved_kwh, 2),
         total_cost_saved_fcfa=round(total_saved_kwh * settings.ENERGY_COST_PER_KWH_FCFA, 2),
         execution_time_ms=exec_time_ms,
-        assignments=optimized_assignments
+        assignments=optimized_list
     )
 
 
@@ -1204,8 +1598,8 @@ async def generate_full_schedule(payload: FullScheduleRequest):
 @app.post("/api/v1/recommendations/hybrid")
 def get_hybrid_recommendations(req: ManualRecommendationRequest) -> List[Dict[str, Any]]:
     """
-    Assistant Hybride : Croise les données Excel (Salles/Profs/Capacité/Expertise) et les réservations .ics 
-    (STORED_ASSIGNMENTS) pour recommander 6 alternatives cohérentes avec 2 à 3 intervenants différents.
+    Assistant Hybride : Croise les données Excel (Salles/Profs/Capacité/Expertise) et les réservations
+    pour recommander 6 alternatives cohérentes.
     """
     salles_list = EXCEL_RESOURCES_DATA.get("salles", [])
     teachers_list = EXCEL_RESOURCES_DATA.get("enseignants", [])
@@ -1219,10 +1613,11 @@ def get_hybrid_recommendations(req: ManualRecommendationRequest) -> List[Dict[st
                 student_count = safe_int_capacity(p.get("Effectif Etudiants"), default=student_count)
                 break
 
+    reference_schedule = OPTIMIZED_ASSIGNMENTS if OPTIMIZED_ASSIGNMENTS else RAW_ICS_ASSIGNMENTS
     occupied_rooms = set()
     occupied_teachers_per_slot: Dict[Tuple[str, str], set] = {}
 
-    for assign in STORED_ASSIGNMENTS:
+    for assign in reference_schedule:
         s_name = str(getattr(assign, 'assigned_room', '')).lower()
         t_slot = str(getattr(assign, 'timeslot', '')).lower()
         d_val = str(getattr(assign, 'date', '') or '').lower()
@@ -1250,16 +1645,14 @@ def get_hybrid_recommendations(req: ManualRecommendationRequest) -> List[Dict[st
     ]))
 
     course_name = getattr(req, "course_name", None) or getattr(req, "course_id", "Cours")
-    is_non_teacher = any(k in str(course_name).lower() for k in NON_TEACHER_KEYWORDS)
+    teacherless = is_non_teacher_activity(course_name)
 
-    # Sélection des 3 meilleurs intervenants qualifiés distincts
     top_teachers: List[Tuple[str, float]] = (
         [("Sans enseignant", 100.0)]
-        if is_non_teacher
+        if teacherless
         else rank_teachers_by_expertise(course_name, teachers_list, max_teachers=3)
     )
 
-    # Filtrage des salles éligibles (capacité + labo)
     eligible_rooms = []
     for s in salles_list:
         cap = safe_int_capacity(s.get("Capacité"), default=40)
@@ -1268,12 +1661,15 @@ def get_hybrid_recommendations(req: ManualRecommendationRequest) -> List[Dict[st
             continue
         if getattr(req, "requires_lab", False) and not is_lab:
             continue
+        if teacherless and not _is_workroom(s):
+            continue
         eligible_rooms.append(s)
 
     if not eligible_rooms:
-        eligible_rooms = salles_list or [{"Code / Salle": "Salle 101", "Capacité": 40, "Capteur HVAC Smart": "Oui"}]
+        eligible_rooms = [s for s in salles_list if _is_workroom(s)] if teacherless else salles_list
+    if not eligible_rooms:
+        eligible_rooms = [{"Code / Salle": "Salle 101", "Capacité": 40, "Capteur HVAC Smart": "Oui"}]
 
-    # Tri des salles éligibles : priorité aux salles HVAC Smart et au taux de remplissage optimal
     eligible_rooms.sort(
         key=lambda r: (
             1 if "Oui" in str(r.get("Capteur HVAC Smart", "")) else 0,
@@ -1285,7 +1681,6 @@ def get_hybrid_recommendations(req: ManualRecommendationRequest) -> List[Dict[st
     candidate_options: List[Dict[str, Any]] = []
     used_combinations = set()
 
-    # Génération de candidats diversifiés combinant les 2 à 3 intervenants différents et les créneaux/salles libres
     for slot_idx, slot in enumerate(candidate_timeslots):
         slot_key = (slot.lower(), req_date)
         busy_teachers = occupied_teachers_per_slot.get(slot_key, set())
@@ -1302,7 +1697,6 @@ def get_hybrid_recommendations(req: ManualRecommendationRequest) -> List[Dict[st
             if (room_name.lower(), slot.lower(), req_date) in occupied_rooms:
                 continue
 
-            # Rotation sur les 2 à 3 intervenants qualifiés pour garantir leur diversité dans les 6 options
             teacher_name, teacher_score = available_for_slot[(slot_idx + room_idx) % len(available_for_slot)]
             combo_key = (slot, room_name, teacher_name)
             if combo_key in used_combinations:
@@ -1333,13 +1727,11 @@ def get_hybrid_recommendations(req: ManualRecommendationRequest) -> List[Dict[st
         if len(candidate_options) >= 18:
             break
 
-    # Tri par score global décroissant puis sélection équilibrée garantissant 2 à 3 intervenants distincts parmi les 6
     candidate_options.sort(key=lambda x: x["global_score"], reverse=True)
 
     selected: List[Dict[str, Any]] = []
     seen_teachers = set()
 
-    # Passe 1 : garantir au moins 1 proposition pour chacun des 2 à 3 intervenants distincts
     for opt in candidate_options:
         if opt["teacher_id"] not in seen_teachers:
             selected.append(opt)
@@ -1347,17 +1739,21 @@ def get_hybrid_recommendations(req: ManualRecommendationRequest) -> List[Dict[st
         if len(selected) >= 3:
             break
 
-    # Passe 2 : compléter jusqu'à 6 alternatives avec les meilleures options restantes
     for opt in candidate_options:
         if opt not in selected:
             selected.append(opt)
         if len(selected) >= 6:
             break
 
-    # Secours si moins de 6 options libres ont été trouvées
     while len(selected) < 6:
         idx_fb = len(selected)
-        assigned_room, kwh = match_room_by_capacity_hvac(course_name, student_count, salles_list, idx_fb)
+        assigned_room, kwh = match_room_by_capacity_hvac(
+            course_name,
+            student_count,
+            salles_list,
+            idx_fb,
+            workroom_only=teacherless
+        )
         t_name, t_score = top_teachers[idx_fb % len(top_teachers)]
         fb_slot = candidate_timeslots[idx_fb % len(candidate_timeslots)]
         selected.append({
@@ -1371,7 +1767,6 @@ def get_hybrid_recommendations(req: ManualRecommendationRequest) -> List[Dict[st
             "co2_saved_kg": round(kwh * 0.45, 2)
         })
 
-    # Re-tri final par score décroissant et attribution des rangs 1 à 6
     selected.sort(key=lambda x: x["global_score"], reverse=True)
     for rank_idx, opt in enumerate(selected[:6], start=1):
         opt["rank"] = rank_idx
@@ -1383,35 +1778,38 @@ def get_hybrid_recommendations(req: ManualRecommendationRequest) -> List[Dict[st
 @app.post("/api/v1/recommendations/confirm")
 async def confirm_recommendation(payload: ConfirmRecommendationRequest):
     """
-    Valide une proposition de l'Assistant Hybride :
-    1. Ajoute / Met à jour l'affectation (Salle + Prof) dans STORED_ASSIGNMENTS.
-    2. Sauvegarde la mise à jour dans data/ics/planit_optimized_schedule.ics.
+    Valide une proposition de l'Assistant Hybride dans l'emploi du temps optimisé
+    sans modifier les fichiers .ics simples d'origine.
     """
-    global STORED_ASSIGNMENTS
+    global OPTIMIZED_ASSIGNMENTS
 
     assignment = payload.assignment
+    if is_non_teacher_activity(assignment.course_id):
+        assignment.teacher_id = "Sans enseignant"
+    assignment.resolution_method = "SMA_CNP"
 
     existing_idx = None
-    for idx, item in enumerate(STORED_ASSIGNMENTS):
-        if (item.course_id == assignment.course_id and 
-            item.group_id == assignment.group_id):
+    for idx, item in enumerate(OPTIMIZED_ASSIGNMENTS):
+        if (item.course_id == assignment.course_id and
+            item.group_id == assignment.group_id and
+            getattr(item, "date", None) == getattr(assignment, "date", None)):
             existing_idx = idx
             break
 
     if existing_idx is not None:
-        STORED_ASSIGNMENTS[existing_idx] = assignment
+        OPTIMIZED_ASSIGNMENTS[existing_idx] = assignment
         action = "mise à jour"
     else:
-        STORED_ASSIGNMENTS.append(assignment)
+        OPTIMIZED_ASSIGNMENTS.append(assignment)
         action = "ajoutée"
 
-    save_assignments_to_ics(STORED_ASSIGNMENTS)
+    save_optimized_assignments_to_ics(OPTIMIZED_ASSIGNMENTS)
 
     return {
         "success": True,
-        "message": f"Proposition ({assignment.assigned_room} avec {assignment.teacher_id}) {action} et enregistrée dans planit_optimized_schedule.ics",
+        "message": f"Proposition ({assignment.assigned_room} avec {assignment.teacher_id}) {action} dans le planning optimisé.",
         "assignment": assignment,
-        "total_courses": len(STORED_ASSIGNMENTS)
+        "total_courses": len(OPTIMIZED_ASSIGNMENTS)
     }
 
 
@@ -1419,52 +1817,67 @@ async def confirm_recommendation(payload: ConfirmRecommendationRequest):
 class HyperplanningSyncRequest(BaseModel):
     ical_url: str
 
+
 @app.get(f"{settings.API_V1_STR}/hyperplanning/all-assignments", response_model=List[AssignmentResult])
+@app.get("/api/hyperplanning/all-assignments", response_model=List[AssignmentResult])
 async def get_all_assignments():
-    return STORED_ASSIGNMENTS
+    """Retourne les affectations brutes (.ics simples) et les affectations optimisées (SMA) séparément."""
+    return RAW_ICS_ASSIGNMENTS + OPTIMIZED_ASSIGNMENTS
+
+
+@app.get(f"{settings.API_V1_STR}/hyperplanning/raw-assignments", response_model=List[AssignmentResult])
+async def get_raw_ics_assignments():
+    """Retourne uniquement l'emploi du temps simple issu des fichiers .ics d'origine."""
+    return RAW_ICS_ASSIGNMENTS
+
+
+@app.get(f"{settings.API_V1_STR}/hyperplanning/optimized-assignments", response_model=List[AssignmentResult])
+async def get_optimized_assignments():
+    """Retourne uniquement l'emploi du temps optimisé par le SMA."""
+    return OPTIMIZED_ASSIGNMENTS
+
 
 @app.post(f"{settings.API_V1_STR}/hyperplanning/sync-url", response_model=List[AssignmentResult])
 async def sync_hyperplanning_via_url(req: HyperplanningSyncRequest):
-    global STORED_ASSIGNMENTS
+    global RAW_ICS_ASSIGNMENTS
     try:
         assignments = await HyperplanningService.fetch_and_parse_ical(req.ical_url)
-        STORED_ASSIGNMENTS.extend(assignments)
-        save_assignments_to_ics(STORED_ASSIGNMENTS)
-        return STORED_ASSIGNMENTS
+        RAW_ICS_ASSIGNMENTS.extend(_mark_as_raw_ics(assignments))
+        return RAW_ICS_ASSIGNMENTS + OPTIMIZED_ASSIGNMENTS
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+
 @app.post(f"{settings.API_V1_STR}/hyperplanning/upload-ics", response_model=List[AssignmentResult])
 async def upload_hyperplanning_ics(file: UploadFile = File(...)):
-    global STORED_ASSIGNMENTS
+    global RAW_ICS_ASSIGNMENTS
     promo_from_filename = os.path.splitext(file.filename)[0]
     try:
         contents = await file.read()
         ics_text = contents.decode("utf-8")
         assignments = HyperplanningService.parse_ics_content(ics_text, default_promo=promo_from_filename)
-        STORED_ASSIGNMENTS.extend(assignments)
-        save_assignments_to_ics(STORED_ASSIGNMENTS)
-        return STORED_ASSIGNMENTS
+        RAW_ICS_ASSIGNMENTS.extend(_mark_as_raw_ics(assignments))
+        return RAW_ICS_ASSIGNMENTS + OPTIMIZED_ASSIGNMENTS
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erreur de lecture du fichier .ics : {str(e)}")
 
+
 @app.post(f"{settings.API_V1_STR}/hyperplanning/upload-multiple-ics", response_model=List[AssignmentResult])
 async def upload_multiple_hyperplanning_ics(files: List[UploadFile] = File(...)):
-    global STORED_ASSIGNMENTS
-    STORED_ASSIGNMENTS.clear()
-    
+    global RAW_ICS_ASSIGNMENTS
+    RAW_ICS_ASSIGNMENTS.clear()
+
     for file in files:
         promo_from_filename = os.path.splitext(file.filename)[0]
         try:
             contents = await file.read()
             ics_text = contents.decode("utf-8")
             assignments = HyperplanningService.parse_ics_content(ics_text, default_promo=promo_from_filename)
-            STORED_ASSIGNMENTS.extend(assignments)
+            RAW_ICS_ASSIGNMENTS.extend(_mark_as_raw_ics(assignments))
         except Exception as e:
             print(f"Erreur sur le fichier {file.filename} : {e}")
-            
-    save_assignments_to_ics(STORED_ASSIGNMENTS)
-    return STORED_ASSIGNMENTS
+
+    return RAW_ICS_ASSIGNMENTS + OPTIMIZED_ASSIGNMENTS
 
 
 # --- WebSocket pour Console SMA ---

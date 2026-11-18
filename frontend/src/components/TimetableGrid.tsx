@@ -3,7 +3,8 @@ import { AssignmentResult } from '../types';
 import { apiService } from '../services/api';
 import { 
   Zap, Clock, User, DoorOpen, Users, RefreshCw, Search, X, 
-  GraduationCap, Calendar, CalendarDays, Briefcase, Bot, ShieldCheck, Leaf, Sparkles, AlertCircle 
+  GraduationCap, Calendar, CalendarDays, Briefcase, Bot, ShieldCheck, Leaf, Sparkles, AlertCircle,
+  ChevronLeft, ChevronRight
 } from 'lucide-react';
 
 interface TimetableGridProps {
@@ -12,6 +13,16 @@ interface TimetableGridProps {
 }
 
 const DEFAULT_PROMO = 'X2027 - X5';
+
+// Identifie si une affectation provient du moteur d'optimisation SMA
+const isSmaOptimizedItem = (a: AssignmentResult | undefined | null): boolean => {
+  if (!a) return false;
+  return (
+    a.resolution_method === 'SMA_CNP' ||
+    a.resolution_method === 'OR_TOOLS_CP_SAT' ||
+    a.resolution_method === 'SMA'
+  );
+};
 
 // Détermine la semaine ISO (1 à 52) et l'année civile en cours
 const getCurrentISOWeekAndYear = (): { week: number; year: number } => {
@@ -33,6 +44,31 @@ const getMondayOfISOWeek = (week: number, year: number): Date => {
   const targetMonday = new Date(mondayISOWeek1);
   targetMonday.setDate(mondayISOWeek1.getDate() + (week - 1) * 7);
   return targetMonday;
+};
+
+// Extrait le numéro de semaine ISO d'une affectation
+const extractWeekNumber = (a: AssignmentResult | undefined | null): number | null => {
+  if (!a) return null;
+  const norm = (a.timeslot || '').trim();
+  const weekMatch = norm.match(/^S(\d{1,2})_/i);
+  if (weekMatch) {
+    return parseInt(weekMatch[1], 10);
+  }
+  const rawDate: unknown = a.date;
+  let dt: Date | null = null;
+  if (rawDate instanceof Date && !Number.isNaN(rawDate.getTime())) {
+    dt = new Date(Date.UTC(rawDate.getFullYear(), rawDate.getMonth(), rawDate.getDate()));
+  } else if (typeof rawDate === 'string' && /^\d{4}-\d{2}-\d{2}/.test(rawDate)) {
+    const [y, m, d] = rawDate.slice(0, 10).split('-').map(Number);
+    dt = new Date(Date.UTC(y, m - 1, d));
+  }
+  if (dt) {
+    const dayNum = dt.getUTCDay() || 7;
+    dt.setUTCDate(dt.getUTCDate() + 4 - dayNum);
+    const yearStart = new Date(Date.UTC(dt.getUTCFullYear(), 0, 1));
+    return Math.ceil((((dt.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+  }
+  return null;
 };
 
 // Vérifie si un groupe d'affectation correspond à la promotion sélectionnée
@@ -88,8 +124,11 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
 }) => {
   const { week: currentWeekNumber, year: currentYearNumber } = useMemo(() => getCurrentISOWeekAndYear(), []);
 
-  // Sous-onglet actif : 'ics' (Initial) ou 'sma' (Optimisé SMA)
+  // Sous-onglet actif : 'ics' (Simple intact) ou 'sma' (Optimisé SMA)
   const [subTab, setSubTab] = useState<'ics' | 'sma'>('ics');
+
+  // Stockage isolé des cours simples (.ics d'origine) pour qu'ils ne soient jamais écrasés
+  const [rawIcsCache, setRawIcsCache] = useState<AssignmentResult[]>([]);
 
   const [selectedGroup, setSelectedGroup] = useState<string>(DEFAULT_PROMO);
   const [selectedYear, setSelectedYear] = useState<number>(currentYearNumber);
@@ -101,52 +140,114 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
   const [showSyncModal, setShowSyncModal] = useState<boolean>(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  const days = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi'];
+  const days = ['Lundi', 'Mardi', 'Mercredi', 'Jeudi', 'Vendredi', 'Samedi'];
   const timeslots = ['08h00-12h00', '13h00-17h00'];
 
   const availableYears = [2026, 2027];
   const availableWeeks = Array.from({ length: 52 }, (_, i) => i + 1);
 
-  // 1. Chargement automatique des emplois du temps au montage
+  // 1. Chargement initial des emplois du temps (bruts + optimisés)
   useEffect(() => {
     apiService.getAllAssignments()
       .then((loadedData) => {
-        if (Array.isArray(loadedData) && loadedData.length > 0 && onAssignmentsUpdated) {
-          onAssignmentsUpdated(loadedData);
+        if (Array.isArray(loadedData) && loadedData.length > 0) {
+          const rawOnly = loadedData.filter((a) => !isSmaOptimizedItem(a));
+          if (rawOnly.length > 0) {
+            setRawIcsCache(rawOnly);
+          }
+          if (onAssignmentsUpdated) {
+            onAssignmentsUpdated(loadedData);
+          }
         }
       })
       .catch((err) => console.error("Erreur récupération cours auto:", err));
   }, []);
 
+  // Préserve toujours les cours bruts (.ics simples) même si le parent ne passe que les résultats SMA
+  useEffect(() => {
+    if (!Array.isArray(assignments) || assignments.length === 0) return;
+    const rawFromProps = assignments.filter((a) => !isSmaOptimizedItem(a));
+    if (rawFromProps.length > 0) {
+      setRawIcsCache(rawFromProps);
+    }
+  }, [assignments]);
+
+  // Liste des cours bruts (.ics simples intacte)
+  const rawIcsAssignments = useMemo(() => {
+    const rawFromProps = Array.isArray(assignments)
+      ? assignments.filter((a) => !isSmaOptimizedItem(a))
+      : [];
+    return rawFromProps.length > 0 ? rawFromProps : rawIcsCache;
+  }, [assignments, rawIcsCache]);
+
+  // Liste des cours optimisés par le SMA
+  const allSmaAssignments = useMemo(() => {
+    if (!Array.isArray(assignments)) return [];
+    return assignments.filter((a) => isSmaOptimizedItem(a));
+  }, [assignments]);
+
+  // Source active selon le sous-onglet sélectionné
+  const activeDataset = subTab === 'sma' ? allSmaAssignments : rawIcsAssignments;
+
   // Liste des promotions uniques disponibles
   const availableGroups = useMemo(() => {
-    if (!Array.isArray(assignments)) return [];
     const groups = new Set<string>();
-    assignments.forEach((a) => {
+    [...rawIcsAssignments, ...allSmaAssignments].forEach((a) => {
       if (a && a.group_id && typeof a.group_id === 'string') {
         groups.add(a.group_id);
       }
     });
     return Array.from(groups).sort();
-  }, [assignments]);
+  }, [rawIcsAssignments, allSmaAssignments]);
 
-  // Sélection automatique du nom exact de la promotion
+  // Sélection automatique d'une promotion valide présente dans les données chargées
   useEffect(() => {
     if (availableGroups.length > 0) {
-      let match = availableGroups.find((g) => g.toLowerCase() === DEFAULT_PROMO.toLowerCase());
-      if (!match) {
-        match = availableGroups.find(
-          (g) => g.toLowerCase().includes('x2027') || g.toLowerCase().includes('x5')
-        );
-      }
-      if (match) {
-        setSelectedGroup(match);
-        setSearchPromo(match);
+      const alreadyValid =
+        selectedGroup === 'ALL' ||
+        availableGroups.some((g) => isGroupMatching(g, selectedGroup));
+
+      if (!alreadyValid) {
+        let match = availableGroups.find((g) => g.toLowerCase() === DEFAULT_PROMO.toLowerCase());
+        if (!match) {
+          match = availableGroups.find(
+            (g) => g.toLowerCase().includes('x2027') || g.toLowerCase().includes('x5')
+          );
+        }
+        const chosen = match || availableGroups[0];
+        setSelectedGroup(chosen);
+        setSearchPromo(chosen);
       }
     }
   }, [availableGroups]);
 
-  // Calcul des dates sous chaque jour
+  // Liste triée des semaines contenant des activités pour la promotion et l'onglet actifs
+  const activeWeeksList = useMemo(() => {
+    const weeksSet = new Set<number>();
+    activeDataset.forEach((a) => {
+      if (!a || !isGroupMatching(a.group_id, selectedGroup)) return;
+      const w = extractWeekNumber(a);
+      if (w !== null && w >= 1 && w <= 52) {
+        weeksSet.add(w);
+      }
+    });
+    return Array.from(weeksSet).sort((a, b) => a - b);
+  }, [activeDataset, selectedGroup]);
+
+  const activeWeeksSet = useMemo(() => new Set<number>(activeWeeksList), [activeWeeksList]);
+
+  // Navigation rapide vers la semaine active précédente / suivante
+  const prevActiveWeek = useMemo(() => {
+    const candidates = activeWeeksList.filter((w) => w < selectedWeek);
+    return candidates.length > 0 ? candidates[candidates.length - 1] : null;
+  }, [activeWeeksList, selectedWeek]);
+
+  const nextActiveWeek = useMemo(() => {
+    const candidates = activeWeeksList.filter((w) => w > selectedWeek);
+    return candidates.length > 0 ? candidates[0] : null;
+  }, [activeWeeksList, selectedWeek]);
+
+  // Calcul des dates sous chaque jour (du Lundi au Samedi)
   const weekDates = useMemo(() => {
     const monday = getMondayOfISOWeek(selectedWeek, selectedYear);
     return days.map((_, index) => {
@@ -174,21 +275,7 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
     );
   }, [availableGroups, searchPromo]);
 
-  // Détection des affectations générées par le SMA
-  const allSmaAssignments = useMemo(() => {
-    if (!Array.isArray(assignments)) return [];
-    return assignments.filter((a) => 
-      a && (
-        a.resolution_method === 'SMA_CNP' || 
-        a.resolution_method === 'OR_TOOLS_CP_SAT' || 
-        a.resolution_method === 'SMA' || 
-        (typeof a.score === 'number' && a.score > 0) ||
-        (typeof a.hvac_saved_kwh === 'number' && a.hvac_saved_kwh > 0)
-      )
-    );
-  }, [assignments]);
-
-  // Total des kWh économisés et nombre de cours ré-alloués par le SMA
+  // Total des kWh économisés par le SMA sur tout l'emploi du temps
   const smaKwhSaved = useMemo(() => {
     const total = allSmaAssignments.reduce((acc, curr) => acc + (curr.hvac_saved_kwh || 0.85), 0);
     return total.toFixed(1);
@@ -200,8 +287,12 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
     setIsLoading(true);
     try {
       const importedAssignments = await apiService.uploadMultipleHyperplanningIcs(files);
-      if (onAssignmentsUpdated && Array.isArray(importedAssignments)) {
-        onAssignmentsUpdated(importedAssignments);
+      if (Array.isArray(importedAssignments)) {
+        const rawOnly = importedAssignments.filter((a) => !isSmaOptimizedItem(a));
+        setRawIcsCache(rawOnly);
+        if (onAssignmentsUpdated) {
+          onAssignmentsUpdated(importedAssignments);
+        }
       }
       setShowSyncModal(false);
     } catch (err) {
@@ -356,14 +447,14 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
               </div>
               <div>
                 <div className="flex items-center space-x-2">
-                  <h3 className="text-sm font-bold text-white">Résultat du Moteur de Négociation Multi-Agents</h3>
+                  <h3 className="text-sm font-bold text-white">Résultat du Moteur de Négociation Multi-Agents (Emploi du temps complet)</h3>
                   <span className="bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1">
                     <ShieldCheck className="w-3 h-3" />
                     Green-IT Pareto
                   </span>
                 </div>
                 <p className="text-xs text-slate-400">
-                  Affectations recalculées basées sur les capteurs HVAC et les préférences enseignants pour la promotion <strong>{selectedGroup}</strong>.
+                  Optimisation sur toutes les semaines d'activités ({activeWeeksList.length} semaines actives pour <strong>{selectedGroup}</strong>) — Salles de travail sans enseignant pour Bilan Briefing, Projets et Soutenances.
                 </p>
               </div>
             </div>
@@ -377,7 +468,7 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
               <div className="h-4 w-px bg-slate-800"></div>
               <div className="flex items-center space-x-1.5">
                 <Sparkles className="w-4 h-4 text-ucac-gold" />
-                <span className="text-slate-400">Cours ré-alloués SMA :</span>
+                <span className="text-slate-400">Séances optimisées :</span>
                 <strong className="text-white font-mono text-sm">{allSmaAssignments.length}</strong>
               </div>
             </div>
@@ -387,7 +478,7 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
             <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-amber-300 text-xs flex items-center gap-2">
               <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
               <span>
-                Aucune négociation SMA n'a encore été lancée. Basculez sur l'onglet <strong>Simulateur SMA</strong> et cliquez sur <strong>"Lancer Négociation SMA"</strong> pour générer l'emploi du temps optimisé.
+                Aucune négociation SMA n'a encore été lancée. Basculez sur l'onglet <strong>Simulateur SMA</strong> et cliquez sur <strong>"Lancer Négociation SMA"</strong> pour optimiser l'ensemble de l'emploi du temps.
               </span>
             </div>
           )}
@@ -417,9 +508,32 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center space-x-3">
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Navigation rapide entre semaines contenant des activités */}
+            <div className="flex items-center space-x-1 bg-slate-50 border border-slate-200 rounded-md px-1.5 py-0.5">
+              <button
+                onClick={() => prevActiveWeek !== null && setSelectedWeek(prevActiveWeek)}
+                disabled={prevActiveWeek === null}
+                className="p-1 rounded hover:bg-slate-200 disabled:opacity-30 text-slate-700"
+                title={prevActiveWeek !== null ? `Semaine active précédente (S${prevActiveWeek})` : 'Aucune semaine active précédente'}
+              >
+                <ChevronLeft className="w-3.5 h-3.5" />
+              </button>
+              <span className="text-[11px] font-semibold text-slate-600 px-1">
+                {activeWeeksList.length} sem. actives
+              </span>
+              <button
+                onClick={() => nextActiveWeek !== null && setSelectedWeek(nextActiveWeek)}
+                disabled={nextActiveWeek === null}
+                className="p-1 rounded hover:bg-slate-200 disabled:opacity-30 text-slate-700"
+                title={nextActiveWeek !== null ? `Semaine active suivante (S${nextActiveWeek})` : 'Aucune semaine active suivante'}
+              >
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
             <div className="text-xs font-semibold text-slate-600 bg-slate-50 px-2.5 py-1 rounded-md border border-slate-200">
-              Promotion : <strong className="text-ucac-navy font-bold">{selectedGroup}</strong> | Semaine : <strong className="text-ucac-navy font-bold">{selectedWeek} ({selectedYear})</strong>
+              Promotion : <strong className="text-ucac-navy font-bold">{selectedGroup}</strong> | Semaine : <strong className="text-ucac-navy font-bold">S{selectedWeek} ({selectedYear})</strong>
             </div>
 
             {(selectedWeek !== currentWeekNumber || selectedYear !== currentYearNumber) && (
@@ -428,17 +542,18 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
                 className="text-xs font-semibold text-ucac-orange hover:text-ucac-navy flex items-center gap-1 transition-colors bg-orange-50 px-2.5 py-1 rounded-md border border-orange-200"
               >
                 <Calendar className="w-3.5 h-3.5" />
-                <span>Semaine actuelle (S{currentWeekNumber} {currentYearNumber})</span>
+                <span>Semaine actuelle (S{currentWeekNumber})</span>
               </button>
             )}
           </div>
         </div>
 
-        {/* Carrousel des 52 Semaines */}
+        {/* Carrousel des 52 Semaines avec indicateur sur chaque semaine ayant des activités */}
         <div className="flex items-center overflow-x-auto space-x-1 pb-1 custom-scrollbar">
           {availableWeeks.map((week) => {
             const isCurrent = week === currentWeekNumber && selectedYear === currentYearNumber;
             const isSelected = week === selectedWeek;
+            const hasActivities = activeWeeksSet.has(week);
             return (
               <button
                 key={week}
@@ -446,15 +561,29 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
                 className={`px-2.5 py-1 text-xs font-mono rounded transition-all min-w-[34px] relative ${
                   isSelected
                     ? 'bg-ucac-orange text-white shadow font-bold'
+                    : hasActivities
+                    ? subTab === 'sma'
+                      ? 'bg-emerald-50 text-emerald-900 font-bold border border-emerald-300 hover:bg-emerald-100'
+                      : 'bg-blue-50 text-ucac-navy font-bold border border-blue-200 hover:bg-blue-100'
                     : isCurrent
                     ? 'bg-orange-100 text-ucac-navy font-bold border border-ucac-orange/50'
-                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                    : 'bg-slate-100 text-slate-400 hover:bg-slate-200 hover:text-slate-700'
                 }`}
-                title={isCurrent ? 'Semaine actuelle' : `Semaine ${week} - ${selectedYear}`}
+                title={
+                  hasActivities
+                    ? `Semaine ${week} (${selectedYear}) — Activités programmées`
+                    : isCurrent
+                    ? 'Semaine actuelle'
+                    : `Semaine ${week} - ${selectedYear}`
+                }
               >
                 {week}
-                {isCurrent && !isSelected && (
-                  <span className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-ucac-orange rounded-full"></span>
+                {hasActivities && !isSelected && (
+                  <span
+                    className={`absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full ${
+                      subTab === 'sma' ? 'bg-emerald-500' : 'bg-ucac-orange'
+                    }`}
+                  ></span>
                 )}
               </button>
             );
@@ -462,7 +591,7 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
         </div>
       </div>
 
-      {/* Grille d'Emploi du Temps dynamique */}
+      {/* Grille d'Emploi du Temps dynamique (Lundi à Samedi) */}
       <div className="bg-white rounded-xl shadow-md border border-slate-200 overflow-x-auto custom-scrollbar">
         <table className="w-full border-collapse text-left text-xs">
           <thead>
@@ -488,38 +617,21 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
                   </div>
                 </td>
                 {days.map((day) => {
-                  // Récupération des affectations correspondant au jour, à l'horaire et à la promotion
-                  const cellAssignments = assignments.filter((a) => {
+                  const isSmaView = subTab === 'sma';
+                  const sourceList = isSmaView ? allSmaAssignments : rawIcsAssignments;
+
+                  const displayItems = sourceList.filter((a) => {
                     if (!a) return false;
                     const matchesGroup = isGroupMatching(a.group_id, selectedGroup);
                     const matchesSlot = isTimeslotMatching(a.timeslot, day, slotTime, selectedWeek);
                     return matchesGroup && matchesSlot;
                   });
 
-                  // En mode SMA, filtrer ou mettre en avant les affectations issues du SMA
-                  const isSmaView = subTab === 'sma';
-                  const displayItems = isSmaView
-                    ? cellAssignments.filter(
-                        (a) =>
-                          a.resolution_method === 'SMA_CNP' ||
-                          a.resolution_method === 'OR_TOOLS_CP_SAT' ||
-                          a.resolution_method === 'SMA' ||
-                          (a.score && a.score > 0) ||
-                          (a.hvac_saved_kwh && a.hvac_saved_kwh > 0)
-                      )
-                    : cellAssignments;
-
                   return (
-                    <td key={day} className="p-2 border-r border-slate-200 min-w-[210px] align-top">
+                    <td key={day} className="p-2 border-r border-slate-200 min-w-[195px] align-top">
                       {displayItems.length === 0 ? (
                         <div className="h-28 border-2 border-dashed border-slate-100 rounded-lg flex items-center justify-center text-slate-300">
-                          {isSmaView && cellAssignments.length > 0 ? (
-                            <span className="text-[10px] text-slate-400 italic text-center p-2">
-                              En attente d'optimisation SMA
-                            </span>
-                          ) : (
-                            'Disponible'
-                          )}
+                          Disponible
                         </div>
                       ) : (
                         displayItems.map((item, i) => {
@@ -527,11 +639,12 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
                             (item.course_id && item.course_id.toLowerCase().includes('stage')) ||
                             (item.assigned_room && item.assigned_room.toLowerCase().includes('stage'));
 
-                          const isOptimizedBySma = 
-                            item.resolution_method === 'SMA_CNP' || 
-                            item.resolution_method === 'OR_TOOLS_CP_SAT' || 
-                            item.resolution_method === 'SMA' ||
-                            (item.score && item.score > 0);
+                          const isOptimizedBySma = isSmaView && isSmaOptimizedItem(item);
+
+                          const isWorkroomSession =
+                            isOptimizedBySma &&
+                            (item.teacher_id === 'Sans enseignant' ||
+                              /bilan|briefing|projet|soutenance|autonomie/i.test(item.course_id || ''));
 
                           return (
                             <div
@@ -539,6 +652,8 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
                               className={`bg-white border-l-4 ${
                                 isStage
                                   ? 'border-l-blue-500 bg-blue-50/20'
+                                  : isWorkroomSession
+                                  ? 'border-l-amber-500 bg-amber-50/30'
                                   : isOptimizedBySma
                                   ? 'border-l-emerald-500 bg-emerald-50/30'
                                   : 'border-l-ucac-orange'
@@ -580,16 +695,22 @@ export const TimetableGrid: React.FC<TimetableGridProps> = ({
                                     </>
                                   )}
                                 </div>
-                                {item.teacher_id && (
-                                  <div className="flex items-center space-x-1 truncate max-w-[100px]">
-                                    <User className="w-3 h-3 text-slate-400" />
-                                    <span title={item.teacher_id}>{item.teacher_id}</span>
-                                  </div>
+                                {isWorkroomSession ? (
+                                  <span className="text-[10px] font-semibold text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">
+                                    Salle de travail
+                                  </span>
+                                ) : (
+                                  item.teacher_id && (
+                                    <div className="flex items-center space-x-1 truncate max-w-[100px]">
+                                      <User className="w-3 h-3 text-slate-400" />
+                                      <span title={item.teacher_id}>{item.teacher_id}</span>
+                                    </div>
+                                  )
                                 )}
                               </div>
 
                               {/* Badges spécifiques au SMA Green-IT */}
-                              {isSmaView && isOptimizedBySma && (
+                              {isOptimizedBySma && (
                                 <div className="flex items-center justify-between pt-1 border-t border-emerald-100 text-[10px]">
                                   <span className="text-emerald-700 font-bold flex items-center gap-1">
                                     <Leaf className="w-3 h-3 text-emerald-600" />

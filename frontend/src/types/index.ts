@@ -38,6 +38,7 @@ export interface FullScheduleRequest {
 }
 
 export interface AssignmentResult {
+  date: boolean;
   course_id: string;
   timeslot: string;
   assigned_room: string;
