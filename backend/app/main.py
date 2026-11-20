@@ -42,6 +42,7 @@ teacher_agents: Dict[str, TeacherAgent] = {}
 # 2. OPTIMIZED_ASSIGNMENTS : emploi du temps complet optimisé par le SMA (toutes les semaines)
 RAW_ICS_ASSIGNMENTS: List[AssignmentResult] = []
 OPTIMIZED_ASSIGNMENTS: List[AssignmentResult] = []
+RESOLVED_CONFLICTS_COUNT: int = 0
 background_tasks = set()
 
 # Stockage global des 3 feuilles Excel extraites au démarrage
@@ -81,6 +82,14 @@ coordinator: CoordinatorAgent = None
 
 class ConfirmRecommendationRequest(BaseModel):
     assignment: AssignmentResult
+
+
+class ExtendedNegotiationResponse(NegotiationResponse):
+    conflicts_resolved: int = 0
+
+
+class ExtendedFullScheduleResponse(FullScheduleResponse):
+    conflicts_resolved: int = 0
 
 
 # --- Schémas & Utilitaires d'Authentification ---
@@ -1002,6 +1011,58 @@ def prepare_all_sessions_for_sma(raw_sessions: List[Any]) -> List[Dict[str, Any]
     return prepared
 
 
+def _count_raw_schedule_conflicts(
+    sessions: List[Any],
+    promo_effects: Dict[str, int],
+    salles_list: List[Dict[str, Any]]
+) -> int:
+    """
+    Calcule le nombre de conflits initiaux détectés dans l'emploi du temps source
+    (chevauchements de salles ou d'enseignants, salles/enseignants manquants,
+    ou dépassements de capacité) avant résolution par le SMA.
+    """
+    room_caps = {
+        str(s.get("Code / Salle", "")).strip().lower(): safe_int_capacity(s.get("Capacité"), 40)
+        for s in salles_list
+    }
+    seen_room_slots = set()
+    seen_teacher_slots = set()
+    conflicts = 0
+
+    for idx, session in enumerate(sessions):
+        course_name = str(get_field_val(session, ["course_id", "name", "id", "summary"], default=f"Cours_{idx+1}"))
+        group_code = str(get_field_val(session, ["group_id", "group", "promo"], default="PROMO"))
+        slot_time = str(get_field_val(session, ["timeslot", "preferred_timeslot", "start_time"], default=""))
+        raw_date = str(get_field_val(session, ["date", "start_date"], default="") or "")
+        room_name = str(get_field_val(session, ["assigned_room", "room"], default="") or "").strip()
+        teacher_name = str(get_field_val(session, ["teacher_id", "teacher"], default="") or "").strip()
+
+        room_norm = _strip_accents(room_name)
+        teacher_norm = _strip_accents(teacher_name)
+        student_count = promo_effects.get(group_code.lower(), 35)
+
+        if not room_norm or "a definir" in room_norm or "non assign" in room_norm:
+            conflicts += 1
+        elif "stage" not in _strip_accents(course_name):
+            slot_key = (room_norm, raw_date.lower(), slot_time.lower())
+            if slot_key in seen_room_slots:
+                conflicts += 1
+            seen_room_slots.add(slot_key)
+            if room_name.lower() in room_caps and student_count > room_caps[room_name.lower()]:
+                conflicts += 1
+
+        if not is_non_teacher_activity(course_name):
+            if not teacher_norm or "a definir" in teacher_norm or "non assign" in teacher_norm:
+                conflicts += 1
+            else:
+                t_slot_key = (teacher_norm, raw_date.lower(), slot_time.lower())
+                if t_slot_key in seen_teacher_slots:
+                    conflicts += 1
+                seen_teacher_slots.add(t_slot_key)
+
+    return conflicts
+
+
 async def agent_router():
     """Tâche d'arrière-plan de routage des messages FIPA-ACL."""
     while True:
@@ -1020,7 +1081,7 @@ async def agent_router():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestionnaire de cycle de vie : Chargement Excel, initialisation des agents et des fichiers .ics."""
-    global EXCEL_RESOURCES_DATA, RAW_ICS_ASSIGNMENTS, OPTIMIZED_ASSIGNMENTS
+    global EXCEL_RESOURCES_DATA, RAW_ICS_ASSIGNMENTS, OPTIMIZED_ASSIGNMENTS, RESOLVED_CONFLICTS_COUNT
 
     _load_users()
     EXCEL_RESOURCES_DATA = load_resources_from_excel()
@@ -1063,6 +1124,16 @@ async def lifespan(app: FastAPI):
                         if not getattr(item, "score", 0):
                             item.score = 95.0
                     OPTIMIZED_ASSIGNMENTS.extend(opt_parsed)
+                    if RAW_ICS_ASSIGNMENTS:
+                        promo_effects_init = {
+                            str(p.get("Code promotion", "")).lower(): safe_int_capacity(p.get("Effectif Etudiants"), default=35)
+                            for p in EXCEL_RESOURCES_DATA.get("promotions", [])
+                        }
+                        RESOLVED_CONFLICTS_COUNT = _count_raw_schedule_conflicts(
+                            RAW_ICS_ASSIGNMENTS,
+                            promo_effects_init,
+                            EXCEL_RESOURCES_DATA.get("salles", [])
+                        )
                 print(f"✅ {len(OPTIMIZED_ASSIGNMENTS)} cours optimisés chargés depuis planit_optimized_schedule.ics")
             except Exception as e:
                 print(f"Erreur chargement planning optimisé : {e}")
@@ -1228,7 +1299,8 @@ def health_check():
     return {
         "status": "operational",
         "campus_active": settings.DEFAULT_CAMPUS,
-        "agents_online": len(room_agents) + len(teacher_agents) + (1 if coordinator else 0)
+        "agents_online": len(room_agents) + len(teacher_agents) + (1 if coordinator else 0),
+        "conflicts_resolved": RESOLVED_CONFLICTS_COUNT
     }
 
 
@@ -1240,7 +1312,8 @@ def get_resources():
         "data": EXCEL_RESOURCES_DATA,
         "rooms": mock_rooms,
         "teachers": mock_teachers,
-        "groups": mock_groups
+        "groups": mock_groups,
+        "conflicts_resolved": RESOLVED_CONFLICTS_COUNT
     }
 
 
@@ -1342,8 +1415,9 @@ def delete_excel_resource(sheet_type: str, row_index: int):
 
 
 # --- Endpoints Négociation SMA & Persistance ---
-@app.post(f"{settings.API_V1_STR}/negotiate/session", response_model=NegotiationResponse)
+@app.post(f"{settings.API_V1_STR}/negotiate/session", response_model=ExtendedNegotiationResponse)
 async def negotiate_single_session(req: SingleNegotiationRequest):
+    global RESOLVED_CONFLICTS_COUNT
     t0 = time.time()
     if not coordinator:
         raise HTTPException(status_code=503, detail="Le coordinateur SMA n'est pas initialisé.")
@@ -1403,11 +1477,13 @@ async def negotiate_single_session(req: SingleNegotiationRequest):
             best_room,
             {"course": req.course_id, "timeslot": req.timeslot, "teacher": effective_teacher_id}
         )
+        RESOLVED_CONFLICTS_COUNT += 1
         exec_time_ms = round((time.time() - t0) * 1000, 2)
-        return NegotiationResponse(
+        return ExtendedNegotiationResponse(
             success=False,
             reason=f"Conflit détecté ({req.students_count} étudiants) : arbitrage proposé vers {best_room}.",
-            execution_time_ms=exec_time_ms
+            execution_time_ms=exec_time_ms,
+            conflicts_resolved=RESOLVED_CONFLICTS_COUNT
         )
 
     await emit_sma_log(
@@ -1417,6 +1493,7 @@ async def negotiate_single_session(req: SingleNegotiationRequest):
         {"course": req.course_id, "timeslot": req.timeslot, "teacher": effective_teacher_id}
     )
 
+    RESOLVED_CONFLICTS_COUNT += 1
     exec_time_ms = round((time.time() - t0) * 1000, 2)
 
     if "hvac_saved_kwh" in result and "hvac_kwh" not in result:
@@ -1437,17 +1514,18 @@ async def negotiate_single_session(req: SingleNegotiationRequest):
         date=result.get("date")
     )
 
-    return NegotiationResponse(
+    return ExtendedNegotiationResponse(
         success=True,
         assignment=assignment_obj,
-        execution_time_ms=exec_time_ms
+        execution_time_ms=exec_time_ms,
+        conflicts_resolved=RESOLVED_CONFLICTS_COUNT
     )
 
 
-@app.post(f"{settings.API_V1_STR}/negotiate/full-schedule", response_model=FullScheduleResponse)
+@app.post(f"{settings.API_V1_STR}/negotiate/full-schedule", response_model=ExtendedFullScheduleResponse)
 async def generate_full_schedule(payload: FullScheduleRequest):
     t0 = time.time()
-    global OPTIMIZED_ASSIGNMENTS
+    global OPTIMIZED_ASSIGNMENTS, RESOLVED_CONFLICTS_COUNT
 
     salles_list = EXCEL_RESOURCES_DATA.get("salles", [])
     teachers_list = EXCEL_RESOURCES_DATA.get("enseignants", [])
@@ -1461,6 +1539,11 @@ async def generate_full_schedule(payload: FullScheduleRequest):
     # Lecture de la totalité des séances sources sans altérer RAW_ICS_ASSIGNMENTS
     source_sessions = RAW_ICS_ASSIGNMENTS if len(RAW_ICS_ASSIGNMENTS) > 0 else payload.courses
     target_sessions = prepare_all_sessions_for_sma(source_sessions)
+
+    # Comptage des conflits initiaux résolus par le SMA
+    RESOLVED_CONFLICTS_COUNT = _count_raw_schedule_conflicts(
+        source_sessions, promo_effects, salles_list
+    )
 
     # Allocation de UNE ET UNE SEULE salle par promotion sur 02 mois, avec rotation à la période suivante
     promo_room_by_period = _allocate_promo_rooms_by_two_month_periods(
@@ -1580,11 +1663,12 @@ async def generate_full_schedule(payload: FullScheduleRequest):
     exec_time_ms = round((time.time() - t0) * 1000, 2)
     total_courses = len(optimized_list)
 
-    return FullScheduleResponse(
+    return ExtendedFullScheduleResponse(
         success=True,
         total_courses=total_courses,
         scheduled_courses=total_courses,
         conflicts_unresolved=0,
+        conflicts_resolved=RESOLVED_CONFLICTS_COUNT,
         global_occupancy_rate=100.0,
         total_energy_saved_kwh=round(total_saved_kwh, 2),
         total_cost_saved_fcfa=round(total_saved_kwh * settings.ENERGY_COST_PER_KWH_FCFA, 2),

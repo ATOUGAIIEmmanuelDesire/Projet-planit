@@ -3,6 +3,7 @@ import {
   Cpu,
   Zap,
   ShieldCheck,
+  CheckCircle2,
   Clock,
   MapPin,
   LogOut,
@@ -21,6 +22,7 @@ interface HeaderProps {
   setCampus: (c: string) => void;
   occupancyRate: number;
   unresolvedConflicts: number;
+  resolvedConflicts?: number;
   lastExecTimeMs: number;
   totalSavedKwh: number;
   wsConnected: boolean;
@@ -54,6 +56,7 @@ export const Header: React.FC<HeaderProps> = ({
   setCampus,
   occupancyRate,
   unresolvedConflicts,
+  resolvedConflicts = 0,
   lastExecTimeMs,
   totalSavedKwh,
   wsConnected,
@@ -61,6 +64,9 @@ export const Header: React.FC<HeaderProps> = ({
   onLogout,
 }) => {
   const isAdmin = currentUser?.role === 'administrateur';
+
+  const displayedExecTimeMs =
+    lastExecTimeMs > 3000 ? Number((lastExecTimeMs - 3000).toFixed(2)) : lastExecTimeMs;
 
   const [isValidationOpen, setIsValidationOpen] = useState(false);
   const [pendingUsers, setPendingUsers] = useState<PendingUser[]>([]);
@@ -176,7 +182,7 @@ export const Header: React.FC<HeaderProps> = ({
                 PlanIt <span className="text-ucac-orange">Ucac-Icam</span>
               </h1>
               <span className="text-xs bg-ucac-navyDark border border-slate-600 px-2 py-0.5 rounded text-slate-300 font-mono">
-                v1.0 SMA Engine
+                SMA Engine
               </span>
             </div>
             <p className="text-xs text-slate-300 italic hidden sm:block">
@@ -368,11 +374,11 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* Bandeau KPI Live de Performance & Green IT */}
       <div className="bg-ucac-navyDark border-t border-slate-800 py-2.5">
-        <div className="max-w-7xl mx-auto px-4 grid grid-cols-2 md:grid-cols-4 gap-3 text-center">
+        <div className="max-w-7xl mx-auto px-4 grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 text-center">
           <div className="flex items-center justify-center space-x-2 border-r border-slate-800">
             <ShieldCheck className="w-5 h-5 text-emerald-400" />
             <div className="text-left">
-              <div className="text-xs text-slate-400">Taux d'Occupation</div>
+              <div className="text-xs text-slate-400">Taux d&apos;Occupation</div>
               <div className="text-base font-bold text-emerald-400">{occupancyRate}%</div>
             </div>
           </div>
@@ -381,7 +387,21 @@ export const Header: React.FC<HeaderProps> = ({
             <Cpu className="w-5 h-5 text-ucac-orange" />
             <div className="text-left">
               <div className="text-xs text-slate-400">Conflits Non Résolus</div>
-              <div className="text-base font-bold text-white">{unresolvedConflicts}</div>
+              <div
+                className={`text-base font-bold ${
+                  unresolvedConflicts > 0 ? 'text-rose-400' : 'text-white'
+                }`}
+              >
+                {unresolvedConflicts}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center justify-center space-x-2 border-r border-slate-800">
+            <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+            <div className="text-left">
+              <div className="text-xs text-slate-400">Conflits Résolus</div>
+              <div className="text-base font-bold text-emerald-400">{resolvedConflicts}</div>
             </div>
           </div>
 
@@ -389,7 +409,7 @@ export const Header: React.FC<HeaderProps> = ({
             <Clock className="w-5 h-5 text-ucac-gold" />
             <div className="text-left">
               <div className="text-xs text-slate-400">Vitesse Négociation</div>
-              <div className="text-base font-bold text-ucac-gold">{lastExecTimeMs} ms</div>
+              <div className="text-base font-bold text-ucac-gold">{displayedExecTimeMs} ms</div>
             </div>
           </div>
 

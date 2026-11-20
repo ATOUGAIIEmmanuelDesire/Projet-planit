@@ -67,6 +67,7 @@ export const App: React.FC = () => {
 
   const [occupancyRate, setOccupancyRate] = useState<number>(85.4);
   const [unresolvedConflicts, setUnresolvedConflicts] = useState<number>(0);
+  const [resolvedConflicts, setResolvedConflicts] = useState<number>(0);
   const [lastExecTimeMs, setLastExecTimeMs] = useState<number>(180);
   const [totalSavedKwh, setTotalSavedKwh] = useState<number>(420.5);
 
@@ -84,6 +85,9 @@ export const App: React.FC = () => {
         setRooms(data.rooms || []);
         setTeachers(data.teachers || []);
         setGroups(data.groups || []);
+        if (typeof data.conflicts_resolved === 'number') {
+          setResolvedConflicts(data.conflicts_resolved);
+        }
       }
     }).catch(console.error);
 
@@ -191,6 +195,7 @@ export const App: React.FC = () => {
         }
         if (response.global_occupancy_rate !== undefined) setOccupancyRate(response.global_occupancy_rate);
         if (response.conflicts_unresolved !== undefined) setUnresolvedConflicts(response.conflicts_unresolved);
+        if (response.conflicts_resolved !== undefined) setResolvedConflicts(response.conflicts_resolved);
         if (response.execution_time_ms !== undefined) setLastExecTimeMs(response.execution_time_ms);
       }
     } catch (error) {
@@ -203,7 +208,21 @@ export const App: React.FC = () => {
   const handleInjectConflict = async () => {
     const targetSlot = assignments.length > 0 ? assignments[0].timeslot : 'S45_Lundi_08h00-12h00';
     const targetGroup = assignments.length > 0 ? assignments[0].group_id : 'B1';
-    await apiService.triggerSingleNegotiation('CONFLICT_TEST', targetSlot, 200, 'T_KIMBA', targetGroup);
+    try {
+      const response = await apiService.triggerSingleNegotiation('CONFLICT_TEST', targetSlot, 200, 'T_KIMBA', targetGroup);
+      if (response) {
+        if (typeof response.conflicts_resolved === 'number') {
+          setResolvedConflicts(response.conflicts_resolved);
+        } else {
+          setResolvedConflicts((prev) => prev + 1);
+        }
+        if (typeof response.execution_time_ms === 'number') {
+          setLastExecTimeMs(response.execution_time_ms);
+        }
+      }
+    } catch (error) {
+      console.error("Erreur lors de l'injection de conflit :", error);
+    }
   };
 
   const handleClearLogs = () => {
@@ -237,6 +256,7 @@ export const App: React.FC = () => {
         setCampus={setCampus}
         occupancyRate={occupancyRate}
         unresolvedConflicts={unresolvedConflicts}
+        resolvedConflicts={resolvedConflicts}
         lastExecTimeMs={lastExecTimeMs}
         totalSavedKwh={totalSavedKwh}
         wsConnected={wsConnected}

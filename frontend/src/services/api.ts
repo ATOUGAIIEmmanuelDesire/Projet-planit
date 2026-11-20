@@ -80,7 +80,12 @@ export const apiService = {
   },
 
   // --- Ressources & Hyperplanning ---
-  async getResources(): Promise<{ rooms: Room[]; teachers: Teacher[]; groups: Group[] }> {
+  async getResources(): Promise<{
+    rooms: Room[];
+    teachers: Teacher[];
+    groups: Group[];
+    conflicts_resolved?: number;
+  }> {
     const res = await axios.get(`${API_BASE_URL}/resources`);
     return res.data;
   },

@@ -55,6 +55,7 @@ export interface FullScheduleResponse {
   total_courses: number;
   scheduled_courses: number;
   conflicts_unresolved: number;
+  conflicts_resolved?: number;
   global_occupancy_rate: number;
   total_energy_saved_kwh: number;
   total_cost_saved_fcfa: number;
@@ -67,6 +68,7 @@ export interface NegotiationResponse {
   assignment?: AssignmentResult;
   reason?: string;
   execution_time_ms: number;
+  conflicts_resolved?: number;
 }
 
 export interface RecommendationOption {
